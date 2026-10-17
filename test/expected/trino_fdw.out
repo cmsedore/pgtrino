@@ -1,0 +1,868 @@
+-- Regression tests for trino_fdw.
+-- They run against test/mock_trino.py listening on 127.0.0.1:18080
+-- (see test/run_tests.sh), so results are deterministic and need no Trino.
+SET client_min_messages = warning;
+SET timezone = 'UTC';
+SET datestyle = 'ISO, YMD';
+SET extra_float_digits = 0;
+SET intervalstyle = 'postgres';
+SELECT trino_fdw_version();
+ trino_fdw_version 
+-------------------
+ 1.0
+(1 row)
+
+-- the mock records every statement it receives; start from a clean log
+CREATE SERVER mock_init FOREIGN DATA WRAPPER trino_fdw
+  OPTIONS (host '127.0.0.1', port '18080', catalog 'mock', schema 's1');
+SELECT count(*) >= 0 AS ok FROM trino_query('mock_init', 'SELECT sql FROM sqllog') AS t(sql text);
+ ok 
+----
+ t
+(1 row)
+
+DROP SERVER mock_init;
+-- ===================================================================
+-- option validation
+-- ===================================================================
+CREATE SERVER mock FOREIGN DATA WRAPPER trino_fdw
+  OPTIONS (host '127.0.0.1', port '18080', catalog 'mock', schema 's1');
+CREATE USER MAPPING FOR PUBLIC SERVER mock OPTIONS (user 'tester');
+CREATE SERVER badopt FOREIGN DATA WRAPPER trino_fdw OPTIONS (hostname 'x');
+ERROR:  invalid option "hostname"
+HINT:  Valid options in this context are: host, port, ssl, ssl_verify, ca_file, catalog, schema, source, session_properties, client_tags, connect_timeout, request_timeout, startup_cost, tuple_cost, default_rows, batch_size
+CREATE SERVER badopt FOREIGN DATA WRAPPER trino_fdw OPTIONS (host 'x', port '99999');
+ERROR:  trino_fdw: invalid value for option "port": "99999"
+DETAIL:  Expected an integer between 1 and 65535.
+CREATE SERVER badopt FOREIGN DATA WRAPPER trino_fdw OPTIONS (host 'x', ssl 'maybe');
+ERROR:  ssl requires a Boolean value
+CREATE SERVER badopt FOREIGN DATA WRAPPER trino_fdw OPTIONS (host 'x', tuple_cost '-1');
+ERROR:  trino_fdw: invalid value for option "tuple_cost": "-1"
+CREATE SERVER nohost FOREIGN DATA WRAPPER trino_fdw OPTIONS (port '1');
+CREATE FOREIGN TABLE nohost_t (x int) SERVER nohost;
+SELECT * FROM nohost_t;
+ERROR:  trino_fdw: server "nohost" has no "host" option
+ALTER SERVER mock OPTIONS (ADD batch_size '0');
+ERROR:  trino_fdw: invalid value for option "batch_size": "0"
+DETAIL:  Expected an integer between 1 and 2147483647.
+ALTER FOREIGN TABLE nohost_t OPTIONS (ADD column_name 'x');
+ERROR:  invalid option "column_name"
+HINT:  Valid options in this context are: catalog, schema_name, table_name, batch_size, default_rows
+ALTER FOREIGN TABLE nohost_t ALTER COLUMN x OPTIONS (ADD table_name 'x');
+ERROR:  invalid option "table_name"
+HINT:  Valid options in this context are: column_name
+-- ===================================================================
+-- IMPORT FOREIGN SCHEMA and type mapping
+-- ===================================================================
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp;
+\d imp.t1
+                                 Foreign table "imp.t1"
+ Column  |              Type              | Collation | Nullable | Default | FDW options 
+---------+--------------------------------+-----------+----------+---------+-------------
+ id      | integer                        |           |          |         | 
+ name    | character varying(10)          |           |          |         | 
+ val     | double precision               |           |          |         | 
+ created | timestamp(6) without time zone |           |          |         | 
+ flag    | boolean                        |           |          |         | 
+ tags    | text[]                         |           |          |         | 
+ attrs   | jsonb                          |           |          |         | 
+ big     | jsonb                          |           |          |         | 
+ bin     | bytea                          |           |          |         | 
+ dec     | numeric(10,2)                  |           |          |         | 
+ d       | date                           |           |          |         | 
+ u       | uuid                           |           |          |         | 
+ ts_tz   | timestamp(3) with time zone    |           |          |         | 
+ dur     | interval                       |           |          |         | 
+Server: mock
+FDW options: (schema_name 's1', table_name 't1')
+
+\d imp.t2
+                        Foreign table "imp.t2"
+ Column |     Type      | Collation | Nullable | Default | FDW options 
+--------+---------------+-----------+----------+---------+-------------
+ k      | bigint        |           |          |         | 
+ v      | numeric(10,2) |           |          |         | 
+ note   | text          |           |          |         | 
+Server: mock
+FDW options: (schema_name 's1', table_name 't2')
+
+\d imp."weird name"
+                  Foreign table "imp.weird name"
+ Column  |  Type   | Collation | Nullable | Default | FDW options 
+---------+---------+-----------+----------+---------+-------------
+ Col One | integer |           |          |         | 
+ x"y     | text    |           |          |         | 
+Server: mock
+FDW options: (schema_name 's1', table_name 'weird name')
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+                                                                       sql                                                                        
+--------------------------------------------------------------------------------------------------------------------------------------------------
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' ORDER BY table_name, ordinal_position
+(1 row)
+
+DROP SCHEMA imp CASCADE;
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 LIMIT TO (t2) FROM SERVER mock INTO imp;
+\det imp.*
+ List of foreign tables
+ Schema | Table | Server 
+--------+-------+--------
+ imp    | t2    | mock
+(1 row)
+
+DROP SCHEMA imp CASCADE;
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 EXCEPT (t2, "weird name") FROM SERVER mock INTO imp;
+\det imp.*
+ List of foreign tables
+ Schema | Table | Server 
+--------+-------+--------
+ imp    | t1    | mock
+(1 row)
+
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (bogus 'x');
+ERROR:  invalid option "bogus"
+HINT:  Valid options in this context are: catalog
+DROP SCHEMA imp CASCADE;
+-- a server without a catalog needs one at import time
+CREATE SERVER nocat FOREIGN DATA WRAPPER trino_fdw OPTIONS (host '127.0.0.1', port '18080');
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 FROM SERVER nocat INTO imp;
+ERROR:  trino_fdw: no Trino catalog specified
+HINT:  Set the "catalog" option on the server, or pass OPTIONS (catalog 'name') to IMPORT FOREIGN SCHEMA.
+IMPORT FOREIGN SCHEMA s1 LIMIT TO (t2) FROM SERVER nocat INTO imp OPTIONS (catalog 'mock');
+\det+ imp.t2
+                                   List of foreign tables
+ Schema | Table | Server |                     FDW options                     | Description 
+--------+-------+--------+-----------------------------------------------------+-------------
+ imp    | t2    | nocat  | (schema_name 's1', table_name 't2', catalog 'mock') | 
+(1 row)
+
+DROP SCHEMA imp CASCADE;
+-- ===================================================================
+-- scanning and value conversion
+-- ===================================================================
+CREATE FOREIGN TABLE t1 (
+  id integer,
+  name varchar(10),
+  val double precision,
+  created timestamp(6),
+  flag boolean,
+  tags text[],
+  attrs jsonb,
+  big jsonb,
+  bin bytea,
+  dec numeric(10,2),
+  d date,
+  u uuid,
+  ts_tz timestamptz,
+  dur interval
+) SERVER mock OPTIONS (table_name 't1');
+SELECT * FROM t1 ORDER BY id;
+ id | name  |    val    |          created           | flag | tags  |  attrs   |      big      |    bin     |  dec  |     d      |                  u                   |           ts_tz            |        dur        
+----+-------+-----------+----------------------------+------+-------+----------+---------------+------------+-------+------------+--------------------------------------+----------------------------+-------------------
+  1 | alpha |       1.5 | 2024-01-02 03:04:05        | t    | {x,y} | {"a": 1} | [[1], [2, 3]] | \xdeadbeef | 12.34 | 2024-01-02 | 12345678-1234-5678-1234-567812345678 | 2024-01-02 03:04:05.123+00 | 00:00:01.5
+  2 | beta  |       NaN |                            | f    | {}    | {}       |               |            | -0.01 |            |                                      | 2024-06-01 16:00:00+00     | -1 days -02:03:04
+  3 |       | -Infinity | 1999-12-31 23:59:59.999999 |      |       |          |               | \x         |  0.00 | 1999-12-31 |                                      |                            | 
+(3 rows)
+
+SELECT id, tags[2], attrs->'a', big->1->0, dur FROM t1 ORDER BY id;
+ id | tags | ?column? | ?column? |        dur        
+----+------+----------+----------+-------------------
+  1 | y    | 1        | 2        | 00:00:01.5
+  2 |      |          |          | -1 days -02:03:04
+  3 |      |          |          | 
+(3 rows)
+
+SELECT count(*) FROM t1;
+ count 
+-------
+     3
+(1 row)
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+                                                                                    sql                                                                                    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ SELECT "id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur" FROM "mock"."s1"."t1" ORDER BY "id" ASC NULLS LAST
+ SELECT "id", "tags", "attrs", "big", "dur" FROM "mock"."s1"."t1" ORDER BY "id" ASC NULLS LAST
+ SELECT 1 FROM "mock"."s1"."t1"
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name, ordinal_position
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name, ordinal_position
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' ORDER BY table_name, ordinal_position
+(6 rows)
+
+-- stopping early cancels the remote query (the mock logs the DELETE)
+SELECT id FROM t1 WHERE name ~ 'a' LIMIT 1;
+ id 
+----
+  1
+(1 row)
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+                    sql                    
+-------------------------------------------
+ <cancel mock_b9362df8>
+ SELECT "id", "name" FROM "mock"."s1"."t1"
+(2 rows)
+
+-- paging with empty pages, 503 retry, zero rows
+CREATE FOREIGN TABLE t1_slow (id integer, name varchar(10)) SERVER mock;
+CREATE FOREIGN TABLE t1_flaky (id integer, name varchar(10)) SERVER mock;
+CREATE FOREIGN TABLE empty (k bigint, v numeric) SERVER mock;
+SELECT * FROM t1_slow ORDER BY id;
+ id | name  
+----+-------
+  1 | alpha
+  2 | beta
+  3 | 
+(3 rows)
+
+SELECT * FROM t1_flaky ORDER BY id;
+ id | name  
+----+-------
+  1 | alpha
+  2 | beta
+  3 | 
+(3 rows)
+
+SELECT * FROM empty;
+ k | v 
+---+---
+(0 rows)
+
+SELECT count(*) FROM empty;
+ count 
+-------
+     0
+(1 row)
+
+-- column_name option and quoting
+CREATE FOREIGN TABLE weird (one integer OPTIONS (column_name 'Col One'), xy text OPTIONS (column_name 'x"y'))
+  SERVER mock OPTIONS (table_name 'weird name');
+EXPLAIN (COSTS OFF) SELECT * FROM weird WHERE one = 1;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Foreign Scan on weird
+   Trino SQL: SELECT "Col One", "x""y" FROM "mock"."s1"."weird name" WHERE ("Col One" = 1)
+(2 rows)
+
+-- a table mapped to the wrong local types
+CREATE FOREIGN TABLE t1_bad (id date) SERVER mock OPTIONS (table_name 't1');
+SELECT * FROM t1_bad;
+ERROR:  invalid input syntax for type date: "1"
+CREATE FOREIGN TABLE t1_nocol (nosuch integer) SERVER mock OPTIONS (table_name 't1');
+SELECT * FROM t1_nocol;
+ERROR:  trino_fdw: Trino query failed: Column 'nosuch' cannot be resolved
+DETAIL:  Trino error COLUMN_NOT_FOUND (USER_ERROR), query id mock_00db6d0f, at line 1, column 8.
+CONTEXT:  Trino SQL: SELECT "nosuch" FROM "mock"."s1"."t1"
+-- ===================================================================
+-- errors from Trino
+-- ===================================================================
+CREATE FOREIGN TABLE boom (id integer) SERVER mock;
+SELECT * FROM boom;
+ERROR:  trino_fdw: Trino query failed: table boom always fails
+DETAIL:  Trino error TABLE_NOT_FOUND (USER_ERROR), query id mock_4df72f3d, at line 1, column 8.
+CONTEXT:  Trino SQL: SELECT "id" FROM "mock"."s1"."boom"
+CREATE FOREIGN TABLE boom_late (id integer, name text) SERVER mock;
+SELECT * FROM boom_late;
+ERROR:  trino_fdw: Trino query failed: worker died
+DETAIL:  Trino error REMOTE_TASK_ERROR (INTERNAL_ERROR), query id mock_97e6fa9b, at line 1, column 8.
+CONTEXT:  Trino SQL: SELECT "id", "name" FROM "mock"."s1"."boom_late"
+CREATE FOREIGN TABLE nosuch (id integer) SERVER mock;
+SELECT * FROM nosuch;
+ERROR:  trino_fdw: Trino query failed: Table 'mock.s1.nosuch' does not exist
+DETAIL:  Trino error TABLE_NOT_FOUND (USER_ERROR), query id mock_b0c8695a, at line 1, column 8.
+CONTEXT:  Trino SQL: SELECT "id" FROM "mock"."s1"."nosuch"
+ALTER SERVER mock OPTIONS (ADD source 'reject-me');
+SELECT * FROM t1;
+ERROR:  trino_fdw: Trino returned HTTP status 403
+DETAIL:  {"message": "source rejected"}
+CONTEXT:  Trino SQL: SELECT "id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur" FROM "mock"."s1"."t1"
+ALTER SERVER mock OPTIONS (DROP source);
+-- ===================================================================
+-- pushdown: what goes to Trino and what stays local
+-- ===================================================================
+CREATE FOREIGN TABLE t2 (k bigint, v numeric(10,2), note text) SERVER mock;
+-- projection
+EXPLAIN (COSTS OFF) SELECT k FROM t2;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2"
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT 1 FROM t2;
+                 QUERY PLAN                  
+---------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT 1 FROM "mock"."s1"."t2"
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT t2 FROM t2;
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k", "v", "note" FROM "mock"."s1"."t2"
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t2;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on t2
+         Trino SQL: SELECT 1 FROM "mock"."s1"."t2"
+(3 rows)
+
+-- operators and literals
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = 1 AND v > 1.5 AND note <> 'x';
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("v" > DECIMAL '1.5') AND ("note" <> 'x') AND ("k" = 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k + 1 > 2 * v - 3 OR k % 2 = 0;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ((("k" + 1) > ((DECIMAL '2' * "v") - DECIMAL '3')) OR (("k" % 2) = 0))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k::numeric = v AND k = 1::smallint::bigint AND v::double precision = 1;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Filter: ((v)::double precision = '1'::double precision)
+   Trino SQL: SELECT "k", "v" FROM "mock"."s1"."t2" WHERE ("k" = 1) AND ("k" = "v")
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note LIKE 'a\_%' AND note NOT LIKE '%z';
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("note" LIKE 'a\_%' ESCAPE '\') AND ("note" NOT LIKE '%z' ESCAPE '\')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note || 'x' = 'yx';
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (("note" || 'x') = 'yx')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k IN (1, 2, 3) AND k NOT IN (4, 5);
+                                           QUERY PLAN                                           
+------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" NOT IN (4, 5)) AND ("k" IN (1, 2, 3))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = ANY ('{}'::bigint[]) OR k <> ALL ('{}'::bigint[]);
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (FALSE OR TRUE)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE v IS NULL AND note IS NOT NULL AND NOT (k = 1);
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("v" IS NULL) AND ("note" IS NOT NULL) AND ("k" <> 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k IS DISTINCT FROM 3;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" IS DISTINCT FROM 3)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE coalesce(v, 0) > 1 AND greatest(k, 5) = 5 AND least(k, v) < 2;
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (COALESCE("v", DECIMAL '0') > DECIMAL '1') AND (GREATEST("k", 5) = 5) AND (LEAST("k", "v") < DECIMAL '2')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE lower(note) = 'a' AND upper(note) = 'A' AND length(note) = 1
+  AND btrim(note) = 'a' AND abs(k) = 1 AND round(v) = 1 AND round(v, 1) = 1.5 AND substr(note, 1, 2) = 'ab'
+  AND ceil(v) = 2 AND floor(v) = 1 AND sqrt(v) < 2;
+                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                   
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (sqrt("v") < DECIMAL '2') AND (lower("note") = 'a') AND (trim("note") = 'a') AND (upper("note") = 'A') AND (length("note") = 1) AND (abs("k") = 1) AND (round("v", 0) = DECIMAL '1') AND (floor("v") = DECIMAL '1') AND (round("v", 1) = DECIMAL '1.5') AND (substr("note", 1, 2) = 'ab') AND (ceiling("v") = DECIMAL '2')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = 1::smallint OR k = 1::bigint OR v = 1::real OR v = 1.5::double precision;
+                                                                    QUERY PLAN                                                                    
+--------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Filter: ((k = '1'::smallint) OR (k = '1'::bigint) OR ((v)::double precision = '1'::real) OR ((v)::double precision = '1.5'::double precision))
+   Trino SQL: SELECT "k", "v" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note = 'it''s' OR note = E'back\\slash';
+                                             QUERY PLAN                                              
+-----------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (("note" = 'it''s') OR ("note" = 'back\slash'))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = 1 AND true;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" = 1)
+(2 rows)
+
+-- typed literals
+CREATE FOREIGN TABLE types (b boolean, d date, ts timestamp, tstz timestamptz, t time, u uuid, bin bytea, f real, dbl double precision, n numeric)
+  SERVER mock OPTIONS (table_name 't2');
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE b = true AND d = '2024-02-29' AND ts = '2024-02-29 13:14:15.5'
+  AND tstz = '2024-02-29 13:14:15+02' AND t = '13:14:15.25' AND u = '12345678-1234-5678-1234-567812345678'
+  AND bin = '\xcafe' AND f = 1.5 AND dbl = 2.5 AND n = 3.25;
+                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                          
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on types
+   Trino SQL: SELECT "b" FROM "mock"."s1"."t2" WHERE "b" AND ("d" = DATE '2024-02-29') AND ("ts" = TIMESTAMP '2024-02-29 13:14:15.500000') AND ("tstz" = TIMESTAMP '2024-02-29 11:14:15 UTC') AND ("t" = TIME '13:14:15.250000') AND ("u" = UUID '12345678-1234-5678-1234-567812345678') AND ("bin" = X'CAFE') AND ("f" = DOUBLE '1.5') AND ("dbl" = DOUBLE '2.5') AND ("n" = DECIMAL '3.25')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE dbl = 'NaN' OR dbl = 'Infinity' OR dbl = '-Infinity';
+                                                       QUERY PLAN                                                       
+------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on types
+   Trino SQL: SELECT "b" FROM "mock"."s1"."t2" WHERE (("dbl" = nan()) OR ("dbl" = infinity()) OR ("dbl" = -infinity()))
+(2 rows)
+
+-- not representable in Trino: infinite dates, numeric NaN, BC dates
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE d = 'infinity' OR ts = '-infinity';
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Foreign Scan on types
+   Filter: ((d = 'infinity'::date) OR (ts = '-infinity'::timestamp without time zone))
+   Trino SQL: SELECT "b", "d", "ts" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE n = 'NaN';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Foreign Scan on types
+   Filter: (n = 'NaN'::numeric)
+   Trino SQL: SELECT "b", "n" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE d = '0044-03-15 BC';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Foreign Scan on types
+   Filter: (d = '0044-03-15 BC'::date)
+   Trino SQL: SELECT "b", "d" FROM "mock"."s1"."t2"
+(3 rows)
+
+-- things that must stay local: collation-dependent ordering, casts, mutable
+-- functions, unknown operators and functions, booleans compared with <
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note > 'a';
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Foreign Scan on t2
+   Filter: (note > 'a'::text)
+   Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k::text = '1';
+                  QUERY PLAN                   
+-----------------------------------------------
+ Foreign Scan on t2
+   Filter: ((k)::text = '1'::text)
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note ~ 'a' OR note ILIKE 'a';
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Foreign Scan on t2
+   Filter: ((note ~ 'a'::text) OR (note ~~* 'a'::text))
+   Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE v > random();
+                     QUERY PLAN                     
+----------------------------------------------------
+ Foreign Scan on t2
+   Filter: ((v)::double precision > random())
+   Trino SQL: SELECT "k", "v" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = 1 AND md5(note) = 'x';
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Foreign Scan on t2
+   Filter: (md5(note) = 'x'::text)
+   Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2" WHERE ("k" = 1)
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE b < true;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Foreign Scan on types
+   Filter: (b < true)
+   Trino SQL: SELECT "b" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k > 1 AND now() > '2020-01-01';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Result
+   One-Time Filter: (now() > '2020-01-01 00:00:00+00'::timestamp with time zone)
+   ->  Foreign Scan on t2
+         Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" > 1)
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE d + 1 > '2024-01-01';
+                     QUERY PLAN                     
+----------------------------------------------------
+ Foreign Scan on types
+   Filter: ((d + 1) > '2024-01-01'::date)
+   Trino SQL: SELECT "b", "d" FROM "mock"."s1"."t2"
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM types WHERE bin < '\x00';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Foreign Scan on types
+   Filter: (bin < '\x00'::bytea)
+   Trino SQL: SELECT "b", "bin" FROM "mock"."s1"."t2"
+(3 rows)
+
+-- ORDER BY and LIMIT pushdown
+EXPLAIN (COSTS OFF) SELECT k, v FROM t2 ORDER BY k DESC NULLS FIRST, v;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k", "v" FROM "mock"."s1"."t2" ORDER BY "k" DESC NULLS FIRST, "v" ASC NULLS LAST
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 ORDER BY k LIMIT 10;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST LIMIT 10
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 ORDER BY k LIMIT 10 OFFSET 5;
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST OFFSET 5 ROWS LIMIT 10
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 LIMIT 10;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" LIMIT 10
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 OFFSET 7;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" OFFSET 7 ROWS
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE v > 1 ORDER BY k LIMIT 3;
+                                                 QUERY PLAN                                                  
+-------------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("v" > DECIMAL '1') ORDER BY "k" ASC NULLS LAST LIMIT 3
+(2 rows)
+
+-- text ordering stays local, LIMIT follows the local sort
+EXPLAIN (COSTS OFF) SELECT k FROM t2 ORDER BY note LIMIT 3;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: note
+         ->  Foreign Scan on t2
+               Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2"
+(5 rows)
+
+-- a local qual keeps LIMIT local but the sort can still be remote
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE note ~ 'a' ORDER BY k LIMIT 3;
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Limit
+   ->  Foreign Scan on t2
+         Filter: (note ~ 'a'::text)
+         Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST
+(4 rows)
+
+-- non-constant limit, FOR UPDATE, WITH TIES, SRFs are not pushed
+EXPLAIN (COSTS OFF) SELECT k FROM t2 ORDER BY k LIMIT (SELECT 1);
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Limit
+   InitPlan 1 (returns $0)
+     ->  Result
+   ->  Foreign Scan on t2
+         Trino SQL: SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT k FROM t2 ORDER BY k FETCH FIRST 2 ROWS WITH TIES;
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Limit
+   ->  Foreign Scan on t2
+         Trino SQL: SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, generate_series(1, 2) FROM t2 ORDER BY k LIMIT 2;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Limit
+   ->  ProjectSet
+         ->  Foreign Scan on t2
+               Trino SQL: SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST
+(4 rows)
+
+-- expressions over pushed-down sorts work through the upper-rel target
+EXPLAIN (COSTS OFF) SELECT k * 2 AS dbl, upper(note) FROM t2 ORDER BY k LIMIT 2;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k", "note" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST LIMIT 2
+(2 rows)
+
+SELECT k * 2 AS dbl, upper(note) FROM t2 ORDER BY k LIMIT 2;
+ dbl | upper 
+-----+-------
+  20 | TEN
+  40 | 
+(2 rows)
+
+SELECT k FROM t2 ORDER BY k DESC;
+ k  
+----
+ 10
+ 20
+(2 rows)
+
+-- aggregates are computed locally
+EXPLAIN (COSTS OFF) SELECT sum(v) FROM t2 WHERE k > 0;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Aggregate
+   ->  Foreign Scan on t2
+         Trino SQL: SELECT "v" FROM "mock"."s1"."t2" WHERE ("k" > 0)
+(3 rows)
+
+-- ===================================================================
+-- parameters
+-- ===================================================================
+SET plan_cache_mode = force_generic_plan;
+PREPARE p1 (bigint, text) AS SELECT k FROM t2 WHERE k = $1 AND (note = $2 OR note IS NULL);
+EXPLAIN (COSTS OFF) EXECUTE p1 (10, 'ten');
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE (("note" = $1) OR ("note" IS NULL)) AND ("k" = $2)
+(2 rows)
+
+EXECUTE p1 (10, 'ten');
+ k  
+----
+ 10
+ 20
+(2 rows)
+
+EXECUTE p1 (10, NULL);
+ k  
+----
+ 10
+ 20
+(2 rows)
+
+RESET plan_cache_mode;
+EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = (SELECT 20);
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Foreign Scan on t2
+   Trino SQL: SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" = $1)
+   InitPlan 1 (returns $0)
+     ->  Result
+(4 rows)
+
+SELECT k FROM t2 WHERE k = (SELECT 20);
+ k  
+----
+ 10
+ 20
+(2 rows)
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE '%"t2"%' ORDER BY 1;
+                                             sql                                              
+----------------------------------------------------------------------------------------------
+ SELECT "k" FROM "mock"."s1"."t2" ORDER BY "k" DESC NULLS FIRST
+ SELECT "k" FROM "mock"."s1"."t2" WHERE ("k" = 20)
+ SELECT "k" FROM "mock"."s1"."t2" WHERE (("note" = 'ten') OR ("note" IS NULL)) AND ("k" = 10)
+ SELECT "k" FROM "mock"."s1"."t2" WHERE (("note" = NULL) OR ("note" IS NULL)) AND ("k" = 10)
+ SELECT "k", "note" FROM "mock"."s1"."t2" ORDER BY "k" ASC NULLS LAST LIMIT 2
+(5 rows)
+
+-- joins: no parameterized paths, so the join itself runs locally
+CREATE TABLE local_k (k bigint);
+INSERT INTO local_k VALUES (10), (30);
+SELECT l.k, t2.note FROM local_k l JOIN t2 USING (k) ORDER BY 1;
+ k  | note 
+----+------
+ 10 | ten
+(1 row)
+
+SELECT a.k, b.k FROM t2 a JOIN t2 b ON a.k < b.k ORDER BY 1, 2;
+ k  | k  
+----+----
+ 10 | 20
+(1 row)
+
+-- ===================================================================
+-- INSERT
+-- ===================================================================
+EXPLAIN (COSTS OFF) INSERT INTO t2 VALUES (1, 2.5, 'x');
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Insert on t2
+   Trino SQL: INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (...)
+   ->  Result
+(3 rows)
+
+INSERT INTO t2 VALUES (1, 2.5, 'x'), (2, NULL, 'it''s');
+INSERT INTO t2 SELECT g, g * 1.5, 'row ' || g FROM generate_series(1, 5) g;
+INSERT INTO t2 (k) VALUES (99) RETURNING k, note;
+ k  | note 
+----+------
+ 99 | 
+(1 row)
+
+COPY t2 FROM STDIN;
+INSERT INTO t1 VALUES (1, 'n', 1.5, '2024-01-02 03:04:05.123456', true, '{a,"b c"}', '{"j": 1}', '[[1]]', '\xcafe', 12.34,
+  '2024-01-02', '12345678-1234-5678-1234-567812345678', '2024-01-02 03:04:05+01', '1 day 02:03:04.5');
+INSERT INTO t1 (id, dur) VALUES (2, '1 year 2 months');
+INSERT INTO t1 (id, dur) VALUES (3, '1 month 1 day');
+ERROR:  trino_fdw: cannot represent a value of type interval as a Trino literal
+INSERT INTO t1 (id, dur) VALUES (5, '30:00:00'), (6, '-1 day -1 hour');
+INSERT INTO t1 (id, val) VALUES (4, 'NaN');
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE 'INSERT%' ORDER BY 1;
+                                                                                                                                                                                                                     sql                                                                                                                                                                                                                     
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ INSERT INTO "mock"."s1"."t1" ("id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur") VALUES (1, 'n', DOUBLE '1.5', TIMESTAMP '2024-01-02 03:04:05.123456', TRUE, ARRAY['a', 'b c'], JSON '{"j": 1}', JSON '[[1]]', X'CAFE', DECIMAL '12.34', DATE '2024-01-02', UUID '12345678-1234-5678-1234-567812345678', TIMESTAMP '2024-01-02 02:04:05 UTC', INTERVAL '1 02:03:04.500' DAY TO SECOND)
+ INSERT INTO "mock"."s1"."t1" ("id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur") VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, INTERVAL '1-2' YEAR TO MONTH)
+ INSERT INTO "mock"."s1"."t1" ("id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur") VALUES (4, NULL, nan(), NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+ INSERT INTO "mock"."s1"."t1" ("id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur") VALUES (5, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, INTERVAL '1 06:00:00' DAY TO SECOND), (6, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, INTERVAL '-1 01:00:00' DAY TO SECOND)
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (1, DECIMAL '1.50', 'row 1'), (2, DECIMAL '3.00', 'row 2'), (3, DECIMAL '4.50', 'row 3'), (4, DECIMAL '6.00', 'row 4'), (5, DECIMAL '7.50', 'row 5')
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (1, DECIMAL '2.50', 'x'), (2, NULL, 'it''s')
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (7, DECIMAL '7.00', 'seven'), (8, NULL, NULL)
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (99, NULL, NULL)
+(8 rows)
+
+UPDATE t2 SET k = 1;
+ERROR:  trino_fdw: UPDATE on a Trino foreign table is not supported
+HINT:  Use trino_execute(server, sql) to run DML directly on Trino.
+DELETE FROM t2;
+ERROR:  trino_fdw: DELETE on a Trino foreign table is not supported
+HINT:  Use trino_execute(server, sql) to run DML directly on Trino.
+INSERT INTO t2 VALUES (1, 1, 'x') ON CONFLICT DO NOTHING;
+ERROR:  trino_fdw: INSERT ... ON CONFLICT is not supported
+CREATE FOREIGN TABLE boom_w (id integer) SERVER mock OPTIONS (table_name 'boom');
+INSERT INTO boom_w VALUES (1);
+ERROR:  trino_fdw: Trino query failed: insert failed on purpose
+DETAIL:  Trino error CONSTRAINT_VIOLATION (USER_ERROR), query id mock_89767852, at line 1, column 8.
+CONTEXT:  Trino SQL: INSERT INTO "mock"."s1"."boom" ("id") VALUES (1)
+-- batch size is honoured
+ALTER FOREIGN TABLE t2 OPTIONS (batch_size '2');
+INSERT INTO t2 SELECT g, NULL, NULL FROM generate_series(1, 5) g;
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE 'INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (%, NULL, NULL)%' ORDER BY 1;
+                                           sql                                           
+-----------------------------------------------------------------------------------------
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (1, NULL, NULL), (2, NULL, NULL)
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (3, NULL, NULL), (4, NULL, NULL)
+ INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (5, NULL, NULL)
+(3 rows)
+
+-- ===================================================================
+-- passthrough functions
+-- ===================================================================
+SELECT * FROM trino_query('mock', 'SELECT "k", "v" FROM t2') AS t(k bigint, v numeric);
+ k  |  v   
+----+------
+ 10 | 1.00
+ 20 | 2.00
+(2 rows)
+
+SELECT * FROM trino_query('mock', 'SELECT "k" FROM t2') AS t(k bigint, v numeric);
+ERROR:  trino_fdw: Trino returned 1 column(s) but the column definition list has 2
+SELECT * FROM trino_query('mock', 'SELECT "k" FROM boom') AS t(k bigint);
+ERROR:  trino_fdw: Trino query failed: table boom always fails
+DETAIL:  Trino error TABLE_NOT_FOUND (USER_ERROR), query id mock_c2d7f93a, at line 1, column 8.
+CONTEXT:  Trino SQL: SELECT "k" FROM boom
+SELECT * FROM trino_query('mock', 'SELECT "k" FROM t2');
+ERROR:  a column definition list is required for functions returning "record"
+LINE 1: SELECT * FROM trino_query('mock', 'SELECT "k" FROM t2');
+                      ^
+SELECT trino_execute('mock', 'CREATE TABLE x (a int)');
+ trino_execute 
+---------------
+            -1
+(1 row)
+
+SELECT trino_execute('mock', 'INSERT INTO x VALUES (1), (2)');
+ trino_execute 
+---------------
+             2
+(1 row)
+
+SELECT trino_query('nonexistent', 'SELECT 1');
+ERROR:  a column definition list is required for trino_query()
+HINT:  Example: SELECT * FROM trino_query('srv', 'SELECT 1') AS t(x integer)
+-- ===================================================================
+-- privileges: USAGE on the server is required for passthrough
+-- ===================================================================
+CREATE ROLE trino_fdw_nobody;
+SET ROLE trino_fdw_nobody;
+SELECT trino_execute('mock', 'SELECT 1');
+ERROR:  permission denied for foreign server mock
+RESET ROLE;
+DROP ROLE trino_fdw_nobody;
+-- ===================================================================
+-- ANALYZE
+-- ===================================================================
+ANALYZE t1;
+SELECT reltuples FROM pg_class WHERE oid = 't1'::regclass;
+ reltuples 
+-----------
+         3
+(1 row)
+
+SELECT attname, null_frac FROM pg_stats WHERE tablename = 't1' AND attname IN ('id', 'name') ORDER BY 1;
+ attname | null_frac 
+---------+-----------
+ id      |         0
+ name    |  0.333333
+(2 rows)
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE '%count(*)%' OR sql LIKE '%TABLESAMPLE%' ORDER BY 1;
+                  sql                  
+---------------------------------------
+ SELECT count(*) FROM "mock"."s1"."t1"
+(1 row)
+
+-- ===================================================================
+-- cleanup
+-- ===================================================================
+DROP TABLE local_k;
+DROP SERVER mock CASCADE;
+DROP SERVER nocat CASCADE;
+DROP SERVER nohost CASCADE;

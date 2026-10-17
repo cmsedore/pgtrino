@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  regress:
+    name: "PostgreSQL ${{ matrix.pg }}: build + mock regression"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [14, 15, 16, 17]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL ${{ matrix.pg }} and libcurl
+        run: |
+          sudo apt-get install -y curl ca-certificates gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }} libcurl4-openssl-dev
+      - name: Build and install
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make PG_CONFIG=$PG_CONFIG
+          sudo make PG_CONFIG=$PG_CONFIG install
+      - name: Start PostgreSQL
+        run: |
+          sudo pg_ctlcluster ${{ matrix.pg }} main start
+          sudo -u postgres psql -c "CREATE ROLE runner SUPERUSER LOGIN"
+      - name: Regression tests against the mock Trino server
+        run: test/run_tests.sh PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+      - name: Show diffs on failure
+        if: failure()
+        run: cat test/regression.diffs || true
+
+  integration:
+    name: "Integration against Trino"
+    runs-on: ubuntu-latest
+    services:
+      trino:
+        image: trinodb/trino:476
+        ports:
+          - 8080:8080
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PostgreSQL 16 and libcurl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16 postgresql-server-dev-16 libcurl4-openssl-dev
+      - name: Build and install
+        run: |
+          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
+          sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+      - name: Add a memory catalog to Trino
+        run: |
+          CID=$(docker ps -q --filter ancestor=trinodb/trino:476)
+          echo "connector.name=memory" > memory.properties
+          docker cp memory.properties "$CID":/etc/trino/catalog/memory.properties
+          docker restart "$CID"
+      - name: Start PostgreSQL
+        run: |
+          sudo pg_ctlcluster 16 main start
+          sudo -u postgres psql -c "CREATE ROLE runner SUPERUSER LOGIN"
+      - name: Wait for Trino
+        run: |
+          for i in $(seq 1 90); do
+            if curl -sf -o /dev/null http://localhost:8080/v1/info && \
+               curl -s http://localhost:8080/v1/info | grep -q '"starting":false'; then exit 0; fi
+            sleep 2
+          done
+          echo "Trino did not become ready"; exit 1
+      - name: Integration tests
+        run: test/integration.sh

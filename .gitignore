@@ -1,0 +1,10 @@
+*.o
+*.so
+*.bc
+/results/
+/test/results/
+/test/regression.diffs
+/test/regression.out
+/test/mock_trino.log
+/log/
+/tmp_check/

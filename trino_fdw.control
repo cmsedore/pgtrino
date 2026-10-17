@@ -1,0 +1,5 @@
+# trino_fdw extension
+comment = 'foreign-data wrapper for Trino'
+default_version = '1.0'
+module_pathname = '$libdir/trino_fdw'
+relocatable = true
