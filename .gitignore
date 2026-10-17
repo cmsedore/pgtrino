@@ -8,3 +8,4 @@
 /test/mock_trino.log
 /log/
 /tmp_check/
+/test/mock_trino_spooling.log

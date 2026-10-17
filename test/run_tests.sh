@@ -11,7 +11,10 @@ PORT=18080
 
 python3 -I test/mock_trino.py "$PORT" > test/mock_trino.log 2>&1 &
 MOCK_PID=$!
-trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
+# a second instance that answers with spooled-protocol segments
+python3 -I test/mock_trino.py "$((PORT + 1))" spooling > test/mock_trino_spooling.log 2>&1 &
+MOCK2_PID=$!
+trap 'kill $MOCK_PID $MOCK2_PID 2>/dev/null || true' EXIT
 
 # wait for the mock to accept connections
 for _ in $(seq 1 50); do

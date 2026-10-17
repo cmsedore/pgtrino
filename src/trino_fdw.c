@@ -36,7 +36,10 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/prep.h"
+#include "utils/selfuncs.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -63,7 +66,18 @@ enum TrinoScanPrivateIndex
 	TrinoScanPrivateSql,		/* SQL template (String) */
 	TrinoScanPrivateRetrievedAttrs, /* attnums in the scan slot (int list) */
 	TrinoScanPrivateParamOffsets,	/* byte offsets of params (int list) */
-	TrinoScanPrivateRelid		/* foreign table OID (Integer) */
+	TrinoScanPrivateRelid,		/* a foreign table OID (Integer), for options */
+	TrinoScanPrivateRelations	/* EXPLAIN description of a join/aggregate
+								 * (String), or an empty string */
+};
+
+/* Indexes into ForeignScan.fdw_private for a direct UPDATE/DELETE */
+enum TrinoDirectPrivateIndex
+{
+	TrinoDirectPrivateSql,		/* SQL template (String) */
+	TrinoDirectPrivateParamOffsets, /* byte offsets of params (int list) */
+	TrinoDirectPrivateRelid,	/* target foreign table OID (Integer) */
+	TrinoDirectPrivateSetProcessed	/* whether to count rows (Integer) */
 };
 
 /* Indexes into ModifyTable fdw_private */
@@ -117,6 +131,15 @@ static ForeignScan *trinoGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignre
 static void trinoGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 									  RelOptInfo *input_rel, RelOptInfo *output_rel,
 									  void *extra);
+static void trinoGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
+									 RelOptInfo *outerrel, RelOptInfo *innerrel,
+									 JoinType jointype, JoinPathExtraData *extra);
+static bool trinoPlanDirectModify(PlannerInfo *root, ModifyTable *plan,
+								  Index resultRelation, int subplan_index);
+static void trinoBeginDirectModify(ForeignScanState *node, int eflags);
+static TupleTableSlot *trinoIterateDirectModify(ForeignScanState *node);
+static void trinoEndDirectModify(ForeignScanState *node);
+static void trinoExplainDirectModify(ForeignScanState *node, ExplainState *es);
 static void trinoBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *trinoIterateForeignScan(ForeignScanState *node);
 static void trinoReScanForeignScan(ForeignScanState *node);
@@ -128,6 +151,12 @@ static void trinoBeginForeignModify(ModifyTableState *mtstate,
 									ResultRelInfo *rinfo, List *fdw_private,
 									int subplan_index, int eflags);
 static TupleTableSlot *trinoExecForeignInsert(EState *estate, ResultRelInfo *rinfo,
+											  TupleTableSlot *slot,
+											  TupleTableSlot *planSlot);
+static TupleTableSlot *trinoExecForeignUpdate(EState *estate, ResultRelInfo *rinfo,
+											  TupleTableSlot *slot,
+											  TupleTableSlot *planSlot);
+static TupleTableSlot *trinoExecForeignDelete(EState *estate, ResultRelInfo *rinfo,
 											  TupleTableSlot *slot,
 											  TupleTableSlot *planSlot);
 static TupleTableSlot **trinoExecForeignBatchInsert(EState *estate,
@@ -174,6 +203,7 @@ trino_fdw_handler(PG_FUNCTION_ARGS)
 	routine->GetForeignPaths = trinoGetForeignPaths;
 	routine->GetForeignPlan = trinoGetForeignPlan;
 	routine->GetForeignUpperPaths = trinoGetForeignUpperPaths;
+	routine->GetForeignJoinPaths = trinoGetForeignJoinPaths;
 	routine->BeginForeignScan = trinoBeginForeignScan;
 	routine->IterateForeignScan = trinoIterateForeignScan;
 	routine->ReScanForeignScan = trinoReScanForeignScan;
@@ -184,12 +214,19 @@ trino_fdw_handler(PG_FUNCTION_ARGS)
 	routine->BeginForeignModify = trinoBeginForeignModify;
 	routine->ExecForeignInsert = trinoExecForeignInsert;
 	routine->ExecForeignBatchInsert = trinoExecForeignBatchInsert;
+	routine->ExecForeignUpdate = trinoExecForeignUpdate;
+	routine->ExecForeignDelete = trinoExecForeignDelete;
 	routine->GetForeignModifyBatchSize = trinoGetForeignModifyBatchSize;
 	routine->EndForeignModify = trinoEndForeignModify;
 	routine->BeginForeignInsert = trinoBeginForeignInsert;
 	routine->EndForeignInsert = trinoEndForeignInsert;
 	routine->IsForeignRelUpdatable = trinoIsForeignRelUpdatable;
 	routine->ExplainForeignModify = trinoExplainForeignModify;
+	routine->PlanDirectModify = trinoPlanDirectModify;
+	routine->BeginDirectModify = trinoBeginDirectModify;
+	routine->IterateDirectModify = trinoIterateDirectModify;
+	routine->EndDirectModify = trinoEndDirectModify;
+	routine->ExplainDirectModify = trinoExplainDirectModify;
 
 	routine->AnalyzeForeignTable = trinoAnalyzeForeignTable;
 	routine->ImportForeignSchema = trinoImportForeignSchema;
@@ -224,6 +261,7 @@ static const TrinoOptionDef valid_options[] = {
 	{"source", ForeignServerRelationId},
 	{"session_properties", ForeignServerRelationId},
 	{"client_tags", ForeignServerRelationId},
+	{"spooling", ForeignServerRelationId},
 	{"connect_timeout", ForeignServerRelationId},
 	{"request_timeout", ForeignServerRelationId},
 	{"startup_cost", ForeignServerRelationId},
@@ -332,7 +370,8 @@ trino_fdw_validator(PG_FUNCTION_ARGS)
 				 strcmp(def->defname, "tuple_cost") == 0)
 			(void) option_double(def, 0.0);
 		else if (strcmp(def->defname, "ssl") == 0 ||
-				 strcmp(def->defname, "ssl_verify") == 0)
+				 strcmp(def->defname, "ssl_verify") == 0 ||
+				 strcmp(def->defname, "spooling") == 0)
 			(void) defGetBoolean(def);
 	}
 
@@ -398,6 +437,8 @@ apply_options(TrinoOptions *opts, List *options)
 			opts->session_properties = defGetString(def);
 		else if (strcmp(name, "client_tags") == 0)
 			opts->client_tags = defGetString(def);
+		else if (strcmp(name, "spooling") == 0)
+			opts->spooling = defGetBoolean(def);
 		else if (strcmp(name, "connect_timeout") == 0)
 			opts->connect_timeout = option_int(def, 0, INT_MAX);
 		else if (strcmp(name, "request_timeout") == 0)
@@ -427,9 +468,15 @@ trino_get_server_options(Oid serverid, Oid userid)
 	opts->ssl = false;
 	opts->ssl_verify = true;
 	opts->source = "trino_fdw";
+	opts->spooling = true;
 	opts->connect_timeout = 10;
 	opts->request_timeout = 0;
-	opts->startup_cost = 1000.0;
+	/*
+	 * Like postgres_fdw's fdw_startup_cost.  Keep this moderate: the planner
+	 * treats costs within 1% as equal, so a huge constant would hide the
+	 * differences between pushing work down and doing it locally.
+	 */
+	opts->startup_cost = 100.0;
 	opts->tuple_cost = 0.2;
 	opts->default_rows = 10000;
 	opts->batch_size = 500;
@@ -542,11 +589,15 @@ trinoGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 #if PG_VERSION_NUM >= 170000
 #define TRINO_CREATE_FOREIGNSCAN_PATH(root, rel, rows, startup, total, pathkeys, outer, priv) \
 	create_foreignscan_path(root, rel, NULL, rows, startup, total, pathkeys, outer, NULL, NIL, priv)
+#define TRINO_CREATE_FOREIGN_JOIN_PATH(root, rel, rows, startup, total, pathkeys, outer, priv) \
+	create_foreign_join_path(root, rel, NULL, rows, startup, total, pathkeys, outer, NULL, NIL, priv)
 #define TRINO_CREATE_FOREIGN_UPPER_PATH(root, rel, target, rows, startup, total, pathkeys, priv) \
 	create_foreign_upper_path(root, rel, target, rows, startup, total, pathkeys, NULL, NIL, priv)
 #else
 #define TRINO_CREATE_FOREIGNSCAN_PATH(root, rel, rows, startup, total, pathkeys, outer, priv) \
 	create_foreignscan_path(root, rel, NULL, rows, startup, total, pathkeys, outer, NULL, priv)
+#define TRINO_CREATE_FOREIGN_JOIN_PATH(root, rel, rows, startup, total, pathkeys, outer, priv) \
+	create_foreign_join_path(root, rel, NULL, rows, startup, total, pathkeys, outer, NULL, priv)
 #define TRINO_CREATE_FOREIGN_UPPER_PATH(root, rel, target, rows, startup, total, pathkeys, priv) \
 	create_foreign_upper_path(root, rel, target, rows, startup, total, pathkeys, NULL, priv)
 #endif
@@ -565,7 +616,7 @@ remote_sort_cost(double n)
 
 /* Can every pathkey be turned into a Trino ORDER BY item? */
 static bool
-pathkeys_pushable(PlannerInfo *root, RelOptInfo *baserel, List *pathkeys)
+pathkeys_pushable(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
 {
 	ListCell   *lc;
 
@@ -573,10 +624,170 @@ pathkeys_pushable(PlannerInfo *root, RelOptInfo *baserel, List *pathkeys)
 		return false;
 	foreach(lc, pathkeys)
 	{
-		if (!trino_is_sortable_pathkey(root, baserel, (PathKey *) lfirst(lc)))
+		if (!trino_is_sortable_pathkey(root, rel, (PathKey *) lfirst(lc)))
 			return false;
 	}
 	return true;
+}
+
+/* Cost of fetching a result of the given size, excluding remote work */
+static void
+transfer_cost(TrinoOptions *opts, double retrieved_rows, Cost *startup, Cost *total)
+{
+	*startup = opts->startup_cost;
+	*total = *startup + retrieved_rows * (cpu_tuple_cost + opts->tuple_cost);
+}
+
+/*
+ * Add a pre-sorted variant of a path when the query wants its output in an
+ * order Trino can produce.  The planner compares it against a local Sort.
+ */
+static void
+add_sorted_path(PlannerInfo *root, RelOptInfo *rel, TrinoRelationInfo *fpinfo,
+				bool is_join)
+{
+	TrinoRelationInfo *sorted;
+	ForeignPath *path;
+
+	if (!pathkeys_pushable(root, rel, root->query_pathkeys))
+		return;
+
+	sorted = palloc0(sizeof(TrinoRelationInfo));
+	sorted->pathkeys = root->query_pathkeys;
+	if (is_join)
+		path = TRINO_CREATE_FOREIGN_JOIN_PATH(root, rel, fpinfo->rows,
+											  fpinfo->startup_cost,
+											  fpinfo->total_cost + remote_sort_cost(fpinfo->rows),
+											  root->query_pathkeys,
+											  rel->lateral_relids,
+											  list_make1(sorted));
+	else
+		path = TRINO_CREATE_FOREIGNSCAN_PATH(root, rel, fpinfo->rows,
+											 fpinfo->startup_cost,
+											 fpinfo->total_cost + remote_sort_cost(fpinfo->rows),
+											 root->query_pathkeys,
+											 rel->lateral_relids,
+											 list_make1(sorted));
+	add_path(rel, (Path *) path);
+}
+
+/* State for generate_implied_equalities_for_column's callback */
+typedef struct ec_member_arg
+{
+	Expr	   *current;		/* the EC member we are building clauses for */
+	List	   *already_used;	/* EC members already handled */
+} ec_member_arg;
+
+static bool
+ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
+						  EquivalenceClass *ec, EquivalenceMember *em,
+						  void *arg)
+{
+	ec_member_arg *state = (ec_member_arg *) arg;
+	Expr	   *expr = em->em_expr;
+
+	if (state->current == NULL)
+	{
+		if (list_member(state->already_used, expr))
+			return false;
+		state->current = expr;
+		return true;
+	}
+	return equal(expr, state->current);
+}
+
+/*
+ * Parameterized paths: a join clause such as t.k = outer.k can be sent to
+ * Trino with the outer value as a literal, which lets a nested loop probe
+ * Trino once per outer row.  Each probe is a full Trino query, so these
+ * paths only win when the outer side is small; the costs reflect that.
+ */
+static void
+add_parameterized_paths(PlannerInfo *root, RelOptInfo *baserel,
+						TrinoRelationInfo *fpinfo)
+{
+	List	   *ppi_list = NIL;
+	ListCell   *lc;
+
+	foreach(lc, baserel->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		Relids		required_outer;
+		ParamPathInfo *ppi;
+
+		if (!join_clause_is_movable_to(ri, baserel))
+			continue;
+		if (!trino_is_foreign_expr(root, baserel, ri->clause))
+			continue;
+		required_outer = bms_union(ri->clause_relids, baserel->lateral_relids);
+		required_outer = bms_del_member(required_outer, baserel->relid);
+		if (bms_is_empty(required_outer))
+			continue;
+		ppi = get_baserel_parampathinfo(root, baserel, required_outer);
+		ppi_list = list_append_unique_ptr(ppi_list, ppi);
+	}
+
+	/* clauses implied by equivalence classes, e.g. t.k = outer.k */
+	if (baserel->has_eclass_joins)
+	{
+		ec_member_arg arg;
+
+		arg.already_used = NIL;
+		for (;;)
+		{
+			List	   *clauses;
+
+			arg.current = NULL;
+			clauses = generate_implied_equalities_for_column(root, baserel,
+															 ec_member_matches_foreign,
+															 (void *) &arg,
+															 baserel->lateral_referencers);
+			if (arg.current == NULL)
+				break;
+			arg.already_used = lappend(arg.already_used, arg.current);
+
+			foreach(lc, clauses)
+			{
+				RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+				Relids		required_outer;
+				ParamPathInfo *ppi;
+
+				if (!join_clause_is_movable_to(ri, baserel))
+					continue;
+				if (!trino_is_foreign_expr(root, baserel, ri->clause))
+					continue;
+				required_outer = bms_union(ri->clause_relids, baserel->lateral_relids);
+				required_outer = bms_del_member(required_outer, baserel->relid);
+				if (bms_is_empty(required_outer))
+					continue;
+				ppi = get_baserel_parampathinfo(root, baserel, required_outer);
+				ppi_list = list_append_unique_ptr(ppi_list, ppi);
+			}
+		}
+	}
+
+	foreach(lc, ppi_list)
+	{
+		ParamPathInfo *ppi = (ParamPathInfo *) lfirst(lc);
+		Selectivity sel;
+		double		retrieved_rows;
+		Cost		startup_cost;
+		Cost		total_cost;
+		ForeignPath *path;
+
+		/* the parameter clauses also filter remotely */
+		sel = clauselist_selectivity(root, fpinfo->remote_conds, baserel->relid,
+									 JOIN_INNER, NULL) *
+			clauselist_selectivity(root, ppi->ppi_clauses, baserel->relid,
+								   JOIN_INNER, NULL);
+		retrieved_rows = clamp_row_est(baserel->tuples * sel);
+		transfer_cost(fpinfo->opts, retrieved_rows, &startup_cost, &total_cost);
+
+		path = TRINO_CREATE_FOREIGNSCAN_PATH(root, baserel, ppi->ppi_rows,
+											 startup_cost, total_cost, NIL,
+											 ppi->ppi_req_outer, NIL);
+		add_path(baserel, (Path *) path);
+	}
 }
 
 static void
@@ -590,26 +801,382 @@ trinoGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 										 NIL, baserel->lateral_relids, NIL);
 	add_path(baserel, (Path *) path);
 
+	add_sorted_path(root, baserel, fpinfo, false);
+	add_parameterized_paths(root, baserel, fpinfo);
+}
+
+/* ----------------------------------------------------------------
+ * Planner: join pushdown
+ * ---------------------------------------------------------------- */
+
+/*
+ * Decide whether the join can run on Trino, and if so fill in the joinrel's
+ * TrinoRelationInfo (join clauses, WHERE clauses, local clauses).
+ */
+static bool
+foreign_join_ok(PlannerInfo *root, RelOptInfo *joinrel, JoinType jointype,
+				RelOptInfo *outerrel, RelOptInfo *innerrel,
+				JoinPathExtraData *extra)
+{
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) joinrel->fdw_private;
+	TrinoRelationInfo *fpinfo_o = (TrinoRelationInfo *) outerrel->fdw_private;
+	TrinoRelationInfo *fpinfo_i = (TrinoRelationInfo *) innerrel->fdw_private;
+	List	   *joinclauses = NIL;
+	List	   *vars;
+	ListCell   *lc;
+
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
+		jointype != JOIN_RIGHT && jointype != JOIN_FULL)
+		return false;
+	if (fpinfo_o == NULL || !fpinfo_o->pushdown_safe ||
+		fpinfo_i == NULL || !fpinfo_i->pushdown_safe)
+		return false;
+	/* grouped relations never appear as join inputs, but be explicit */
+	if (IS_UPPER_REL(outerrel) || IS_UPPER_REL(innerrel))
+		return false;
+
 	/*
-	 * If the query wants its output sorted in a way Trino can produce, offer
-	 * a pre-sorted path too.  The planner compares it against a local Sort.
+	 * Row marks (FOR UPDATE, or an UPDATE/DELETE joining this relation) need
+	 * an EvalPlanQual recheck we cannot provide for a remote join.
 	 */
-	if (pathkeys_pushable(root, baserel, root->query_pathkeys))
+	if (root->rowMarks != NIL)
+		return false;
+
+	/* PlaceHolderVars evaluated inside the join cannot be deparsed */
+	foreach(lc, root->placeholder_list)
 	{
-		TrinoRelationInfo *sorted = palloc0(sizeof(TrinoRelationInfo));
+		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
 
-		*sorted = *fpinfo;
-		sorted->pathkeys = root->query_pathkeys;
-		sorted->total_cost = fpinfo->total_cost + remote_sort_cost(fpinfo->rows);
-
-		path = TRINO_CREATE_FOREIGNSCAN_PATH(root, baserel, fpinfo->rows,
-											 sorted->startup_cost,
-											 sorted->total_cost,
-											 root->query_pathkeys,
-											 baserel->lateral_relids,
-											 list_make1(sorted));
-		add_path(baserel, (Path *) path);
+		if (bms_overlap(phinfo->ph_eval_at, joinrel->relids))
+			return false;
 	}
+
+	/*
+	 * Sort the join's restriction clauses: real join conditions of an outer
+	 * join must be shippable (they define the result), WHERE-level clauses
+	 * may stay local.
+	 */
+	foreach(lc, extra->restrictlist)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		bool		is_remote = trino_is_foreign_expr(root, joinrel, ri->clause);
+		bool		is_join_clause = !RINFO_IS_PUSHED_DOWN(ri, joinrel->relids);
+
+		if (is_join_clause)
+		{
+			if (!is_remote)
+			{
+				if (jointype != JOIN_INNER)
+					return false;
+				fpinfo->local_conds = lappend(fpinfo->local_conds, ri);
+			}
+			else
+				joinclauses = lappend(joinclauses, ri);
+		}
+		else if (is_remote)
+		{
+			/*
+			 * For an inner join, WHERE and ON are equivalent; conditions
+			 * spanning both inputs read better in the ON clause.
+			 */
+			if (jointype == JOIN_INNER &&
+				bms_overlap(ri->clause_relids, outerrel->relids) &&
+				bms_overlap(ri->clause_relids, innerrel->relids))
+				joinclauses = lappend(joinclauses, ri);
+			else
+				fpinfo->remote_conds = lappend(fpinfo->remote_conds, ri);
+		}
+		else
+			fpinfo->local_conds = lappend(fpinfo->local_conds, ri);
+	}
+
+	/*
+	 * Fold the inputs' own conditions into the join.  Conditions on the
+	 * nullable side of an outer join must be applied before the join, so
+	 * they move into the ON clause; local conditions there cannot be
+	 * pulled up at all.
+	 */
+	switch (jointype)
+	{
+		case JOIN_INNER:
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+											   list_copy(fpinfo_i->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+											   list_copy(fpinfo_o->remote_conds));
+			fpinfo->local_conds = list_concat(fpinfo->local_conds,
+											  list_copy(fpinfo_i->local_conds));
+			fpinfo->local_conds = list_concat(fpinfo->local_conds,
+											  list_copy(fpinfo_o->local_conds));
+			break;
+		case JOIN_LEFT:
+			if (fpinfo_i->local_conds != NIL)
+				return false;
+			joinclauses = list_concat(joinclauses, list_copy(fpinfo_i->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+											   list_copy(fpinfo_o->remote_conds));
+			fpinfo->local_conds = list_concat(fpinfo->local_conds,
+											  list_copy(fpinfo_o->local_conds));
+			break;
+		case JOIN_RIGHT:
+			if (fpinfo_o->local_conds != NIL)
+				return false;
+			joinclauses = list_concat(joinclauses, list_copy(fpinfo_o->remote_conds));
+			fpinfo->remote_conds = list_concat(fpinfo->remote_conds,
+											   list_copy(fpinfo_i->remote_conds));
+			fpinfo->local_conds = list_concat(fpinfo->local_conds,
+											  list_copy(fpinfo_i->local_conds));
+			break;
+		case JOIN_FULL:
+			if (fpinfo_i->remote_conds != NIL || fpinfo_i->local_conds != NIL ||
+				fpinfo_o->remote_conds != NIL || fpinfo_o->local_conds != NIL)
+				return false;
+			break;
+		default:
+			return false;
+	}
+
+	/* every output column must be a plain column of some input */
+	vars = pull_var_clause((Node *) joinrel->reltarget->exprs,
+						   PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, fpinfo->local_conds)
+		vars = list_concat(vars,
+						   pull_var_clause((Node *) ((RestrictInfo *) lfirst(lc))->clause,
+										   PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, vars)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (!IsA(var, Var) || var->varattno <= 0)
+			return false;
+	}
+
+	fpinfo->outerrel = outerrel;
+	fpinfo->innerrel = innerrel;
+	fpinfo->jointype = jointype;
+	fpinfo->joinclauses = joinclauses;
+	fpinfo->opts = fpinfo_o->opts;
+	fpinfo->relid = fpinfo_o->relid;
+	fpinfo->userid = fpinfo_o->userid;
+	fpinfo->pushdown_safe = true;
+	return true;
+}
+
+static void
+trinoGetForeignJoinPaths(PlannerInfo *root, RelOptInfo *joinrel,
+						 RelOptInfo *outerrel, RelOptInfo *innerrel,
+						 JoinType jointype, JoinPathExtraData *extra)
+{
+	TrinoRelationInfo *fpinfo;
+	TrinoRelationInfo *fpinfo_o;
+	TrinoRelationInfo *fpinfo_i;
+	Selectivity local_sel;
+	double		retrieved_rows;
+	QualCost	local_cost;
+	Cost		startup_cost;
+	Cost		total_cost;
+	ForeignPath *path;
+
+	/* already decided for this joinrel (other join orders) */
+	if (joinrel->fdw_private != NULL)
+		return;
+
+	fpinfo = palloc0(sizeof(TrinoRelationInfo));
+	joinrel->fdw_private = fpinfo;
+	if (!foreign_join_ok(root, joinrel, jointype, outerrel, innerrel, extra))
+	{
+		fpinfo->pushdown_safe = false;
+		return;
+	}
+	fpinfo_o = (TrinoRelationInfo *) outerrel->fdw_private;
+	fpinfo_i = (TrinoRelationInfo *) innerrel->fdw_private;
+	fpinfo->relation_name = trino_relation_name(root, joinrel);
+
+	/* rows: the planner's estimate; before local quals, a bit more */
+	fpinfo->rows = joinrel->rows;
+	local_sel = clauselist_selectivity(root, fpinfo->local_conds, 0,
+									   jointype, extra->sjinfo);
+	retrieved_rows = clamp_row_est(joinrel->rows / Max(local_sel, 1e-6));
+	cost_qual_eval(&local_cost, fpinfo->local_conds, root);
+
+	transfer_cost(fpinfo->opts, retrieved_rows, &startup_cost, &total_cost);
+	/* the remote join itself: a hash join over both inputs */
+	total_cost += (fpinfo_o->rows + fpinfo_i->rows) * cpu_operator_cost;
+	total_cost += local_cost.startup + retrieved_rows * local_cost.per_tuple;
+	fpinfo->startup_cost = startup_cost;
+	fpinfo->total_cost = total_cost;
+
+	path = TRINO_CREATE_FOREIGN_JOIN_PATH(root, joinrel, fpinfo->rows,
+										  startup_cost, total_cost, NIL,
+										  joinrel->lateral_relids, NIL);
+	add_path(joinrel, (Path *) path);
+
+	add_sorted_path(root, joinrel, fpinfo, true);
+}
+
+/* ----------------------------------------------------------------
+ * Planner: upper relations (GROUP BY, ORDER BY, LIMIT)
+ * ---------------------------------------------------------------- */
+
+/*
+ * Check the grouping target and HAVING, and build the list of expressions
+ * the remote query must return: grouping expressions and aggregates.
+ */
+static bool
+foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel, Node *having_qual)
+{
+	Query	   *query = root->parse;
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) grouped_rel->fdw_private;
+	PathTarget *grouping_target = grouped_rel->reltarget;
+	List	   *tlist = NIL;
+	ListCell   *lc;
+	int			i = 0;
+
+	foreach(lc, grouping_target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(grouping_target, i);
+
+		if (sgref && get_sortgroupref_clause_noerr(sgref, query->groupClause))
+		{
+			TargetEntry *tle;
+
+			/* a grouping expression: must be shippable as a whole */
+			if (!trino_is_foreign_expr(root, grouped_rel, expr))
+				return false;
+			tle = makeTargetEntry(expr, list_length(tlist) + 1, NULL, false);
+			tle->ressortgroupref = sgref;
+			tlist = lappend(tlist, tle);
+		}
+		else if (trino_is_foreign_expr(root, grouped_rel, expr))
+		{
+			/* an expression over grouping columns and aggregates */
+			tlist = add_to_flat_tlist(tlist, list_make1(expr));
+		}
+		else
+		{
+			/*
+			 * Not shippable as a whole: fetch the aggregates inside it and
+			 * compute the rest locally.  Plain Vars in it are grouping
+			 * columns (the parser guarantees that) already in the tlist.
+			 */
+			List	   *aggvars = pull_var_clause((Node *) expr,
+												  PVC_INCLUDE_AGGREGATES);
+			ListCell   *lc2;
+
+			foreach(lc2, aggvars)
+			{
+				Expr	   *sub = (Expr *) lfirst(lc2);
+
+				if (!trino_is_foreign_expr(root, grouped_rel, sub))
+					return false;
+				if (IsA(sub, Aggref))
+					tlist = add_to_flat_tlist(tlist, list_make1(sub));
+			}
+		}
+		i++;
+	}
+
+	if (having_qual != NULL)
+	{
+		foreach(lc, (List *) having_qual)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			if (trino_is_foreign_expr(root, grouped_rel, expr))
+				fpinfo->having_remote = lappend(fpinfo->having_remote, expr);
+			else
+				fpinfo->having_local = lappend(fpinfo->having_local, expr);
+		}
+	}
+
+	/* aggregates in local HAVING clauses must be fetched too */
+	if (fpinfo->having_local != NIL)
+	{
+		List	   *aggvars = pull_var_clause((Node *) fpinfo->having_local,
+											  PVC_INCLUDE_AGGREGATES);
+
+		foreach(lc, aggvars)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			if (IsA(expr, Aggref) && !trino_is_foreign_expr(root, grouped_rel, expr))
+				return false;
+			tlist = add_to_flat_tlist(tlist, list_make1(expr));
+		}
+	}
+
+	fpinfo->grouped_tlist = tlist;
+	return true;
+}
+
+static void
+add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+						   RelOptInfo *grouped_rel, GroupPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	TrinoRelationInfo *ifpinfo = (TrinoRelationInfo *) input_rel->fdw_private;
+	TrinoRelationInfo *fpinfo;
+	List	   *group_exprs;
+	double		num_groups;
+	Cost		startup_cost;
+	Cost		total_cost;
+	ForeignPath *path;
+
+	if (parse->groupingSets != NIL)
+		return;
+	if (extra->patype != PARTITIONWISE_AGGREGATE_NONE)
+		return;
+	if (IS_UPPER_REL(input_rel))
+		return;
+	/* local quals must run before aggregation, so nothing can be pushed */
+	if (ifpinfo->local_conds != NIL)
+		return;
+	if (root->hasHavingQual && extra->havingQual == NULL)
+		return;
+
+	fpinfo = palloc0(sizeof(TrinoRelationInfo));
+	fpinfo->is_grouped = true;
+	fpinfo->outerrel = input_rel;
+	fpinfo->opts = ifpinfo->opts;
+	fpinfo->relid = ifpinfo->relid;
+	fpinfo->userid = ifpinfo->userid;
+	grouped_rel->fdw_private = fpinfo;
+
+	if (!foreign_grouping_ok(root, grouped_rel, extra->havingQual))
+	{
+		fpinfo->pushdown_safe = false;
+		return;
+	}
+	fpinfo->pushdown_safe = true;
+	fpinfo->relation_name = trino_relation_name(root, grouped_rel);
+
+	/* estimates: Trino returns one row per group */
+	group_exprs = get_sortgrouplist_exprs(parse->groupClause, fpinfo->grouped_tlist);
+	if (group_exprs != NIL)
+		num_groups = estimate_num_groups(root, group_exprs, ifpinfo->rows, NULL, NULL);
+	else
+		num_groups = 1;
+	if (fpinfo->having_remote != NIL || fpinfo->having_local != NIL)
+	{
+		Selectivity sel = clauselist_selectivity(root, fpinfo->having_remote, 0,
+												 JOIN_INNER, NULL);
+
+		fpinfo->rows = clamp_row_est(num_groups * sel);
+	}
+	else
+		fpinfo->rows = num_groups;
+
+	transfer_cost(fpinfo->opts, num_groups, &startup_cost, &total_cost);
+	/* aggregating on the Trino side: one pass over the input */
+	total_cost += ifpinfo->rows * cpu_operator_cost * (list_length(fpinfo->grouped_tlist) + 1);
+	fpinfo->startup_cost = startup_cost;
+	fpinfo->total_cost = total_cost;
+
+	path = TRINO_CREATE_FOREIGN_UPPER_PATH(root, grouped_rel,
+										   grouped_rel->reltarget,
+										   fpinfo->rows, startup_cost, total_cost,
+										   NIL, NIL);
+	add_path(grouped_rel, (Path *) path);
 }
 
 static bool
@@ -630,9 +1197,9 @@ limit_node_ok(Node *node)
 }
 
 /*
- * UPPERREL_ORDERED: the pre-sorted base path already covers ORDER BY, so we
- * add no path here.  We only record on the ordered rel which base rel it
- * sorts and whether the sort is pushable, for the FINAL stage below.
+ * UPPERREL_ORDERED.  For a base or join input the pre-sorted path on that
+ * relation already covers ORDER BY, so only a record is kept for the FINAL
+ * stage.  For a grouped input a sorted path is added here.
  */
 static void
 add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
@@ -640,9 +1207,6 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 {
 	TrinoRelationInfo *ifpinfo = (TrinoRelationInfo *) input_rel->fdw_private;
 	TrinoRelationInfo *fpinfo;
-
-	if (input_rel->reloptkind != RELOPT_BASEREL)
-		return;
 
 	fpinfo = palloc0(sizeof(TrinoRelationInfo));
 	fpinfo->outerrel = input_rel;
@@ -656,12 +1220,28 @@ add_foreign_ordered_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		pathkeys_pushable(root, input_rel, root->sort_pathkeys);
 	fpinfo->pathkeys = fpinfo->pushdown_safe ? root->sort_pathkeys : NIL;
 	ordered_rel->fdw_private = fpinfo;
+
+	if (fpinfo->pushdown_safe && IS_UPPER_REL(input_rel))
+	{
+		TrinoRelationInfo *sorted = palloc0(sizeof(TrinoRelationInfo));
+		ForeignPath *path;
+
+		sorted->pathkeys = root->sort_pathkeys;
+		path = TRINO_CREATE_FOREIGN_UPPER_PATH(root, input_rel,
+											   root->upper_targets[UPPERREL_ORDERED],
+											   fpinfo->rows, fpinfo->startup_cost,
+											   fpinfo->total_cost,
+											   root->sort_pathkeys,
+											   list_make1(sorted));
+		add_path(ordered_rel, (Path *) path);
+	}
 }
 
 /*
  * UPPERREL_FINAL: push LIMIT/OFFSET (and the ORDER BY beneath it) down.
- * The new path's parent is the base rel, so GetForeignPlan sees an ordinary
- * scan plus the extra clauses carried in the path's fdw_private.
+ * The new path's parent is the relation being scanned (base, join or
+ * grouped), so GetForeignPlan sees an ordinary scan of it plus the extra
+ * clauses carried in the path's fdw_private.
  */
 static void
 add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
@@ -669,9 +1249,9 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 {
 	Query	   *parse = root->parse;
 	TrinoRelationInfo *ifpinfo = (TrinoRelationInfo *) input_rel->fdw_private;
-	TrinoRelationInfo *base_fpinfo;
+	TrinoRelationInfo *scan_fpinfo;
 	TrinoRelationInfo *fpinfo;
-	RelOptInfo *baserel;
+	RelOptInfo *scanrel;
 	List	   *pathkeys = NIL;
 	Node	   *limit_count;
 	Node	   *limit_offset;
@@ -698,37 +1278,39 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	if (limit_count == NULL && limit_offset == NULL)
 		return;
 
-	if (input_rel->reloptkind == RELOPT_BASEREL)
+	if (ifpinfo->is_grouped || !IS_UPPER_REL(input_rel))
 	{
+		/* base, join or grouped relation: no ORDER BY in the query */
 		if (parse->sortClause != NIL)
 			return;
-		baserel = input_rel;
+		scanrel = input_rel;
 	}
-	else if (input_rel->reloptkind == RELOPT_UPPER_REL &&
-			 ifpinfo->outerrel != NULL && ifpinfo->pushdown_safe)
+	else if (ifpinfo->outerrel != NULL && ifpinfo->pushdown_safe)
 	{
 		/* our ordered rel: the sort goes to Trino together with the limit */
-		baserel = ifpinfo->outerrel;
+		scanrel = ifpinfo->outerrel;
 		pathkeys = ifpinfo->pathkeys;
 	}
 	else
 		return;
 
-	base_fpinfo = (TrinoRelationInfo *) baserel->fdw_private;
+	scan_fpinfo = (TrinoRelationInfo *) scanrel->fdw_private;
+	if (!scan_fpinfo->pushdown_safe)
+		return;
 	/* LIMIT applies after filtering, so every qual must be remote */
-	if (base_fpinfo->local_conds != NIL)
+	if (scan_fpinfo->local_conds != NIL || scan_fpinfo->having_local != NIL)
 		return;
 
 	fpinfo = palloc0(sizeof(TrinoRelationInfo));
 	fpinfo->pushdown_safe = true;
-	fpinfo->outerrel = baserel;
+	fpinfo->outerrel = scanrel;
 	fpinfo->pathkeys = pathkeys;
 	fpinfo->has_limit = true;
 	fpinfo->limit_count = limit_count;
 	fpinfo->limit_offset = limit_offset;
-	fpinfo->opts = base_fpinfo->opts;
-	fpinfo->relid = base_fpinfo->relid;
-	fpinfo->userid = base_fpinfo->userid;
+	fpinfo->opts = scan_fpinfo->opts;
+	fpinfo->relid = scan_fpinfo->relid;
+	fpinfo->userid = scan_fpinfo->userid;
 	final_rel->fdw_private = fpinfo;
 
 	/*
@@ -751,7 +1333,7 @@ add_foreign_final_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	fpinfo->startup_cost = startup_cost;
 	fpinfo->total_cost = total_cost;
 
-	path = TRINO_CREATE_FOREIGN_UPPER_PATH(root, baserel,
+	path = TRINO_CREATE_FOREIGN_UPPER_PATH(root, scanrel,
 										   root->upper_targets[UPPERREL_FINAL],
 										   rows, startup_cost, total_cost,
 										   pathkeys, list_make1(fpinfo));
@@ -765,13 +1347,17 @@ trinoGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 {
 	TrinoRelationInfo *ifpinfo = (TrinoRelationInfo *) input_rel->fdw_private;
 
-	if (ifpinfo == NULL)
+	if (ifpinfo == NULL || !ifpinfo->pushdown_safe)
 		return;
 	if (output_rel->fdw_private != NULL)
 		return;
 
 	switch (stage)
 	{
+		case UPPERREL_GROUP_AGG:
+			add_foreign_grouping_paths(root, input_rel, output_rel,
+									   (GroupPathExtraData *) extra);
+			break;
 		case UPPERREL_ORDERED:
 			add_foreign_ordered_paths(root, input_rel, output_rel);
 			break;
@@ -782,6 +1368,25 @@ trinoGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		default:
 			break;
 	}
+}
+
+/*
+ * Build the list of expressions a join or grouped scan must fetch: what the
+ * relation's target needs plus what the local quals need.
+ */
+static List *
+build_scan_tlist(RelOptInfo *rel, List *local_exprs)
+{
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+	List	   *vars;
+
+	if (fpinfo->is_grouped)
+		return fpinfo->grouped_tlist;
+
+	vars = pull_var_clause((Node *) rel->reltarget->exprs, PVC_RECURSE_PLACEHOLDERS);
+	vars = list_concat(vars, pull_var_clause((Node *) local_exprs,
+											 PVC_RECURSE_PLACEHOLDERS));
+	return add_to_flat_tlist(NIL, vars);
 }
 
 static ForeignScan *
@@ -796,9 +1401,11 @@ trinoGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel, Oid foreigntablei
 	bool		has_limit = extra ? extra->has_limit : false;
 	Node	   *limit_count = extra ? extra->limit_count : NULL;
 	Node	   *limit_offset = extra ? extra->limit_offset : NULL;
+	Index		scan_relid = 0;
 	List	   *remote_conds = NIL;
 	List	   *local_exprs = NIL;
 	List	   *remote_exprs = NIL;
+	List	   *fdw_scan_tlist = NIL;
 	List	   *retrieved_attrs;
 	List	   *params_list;
 	List	   *param_offsets;
@@ -806,43 +1413,58 @@ trinoGetForeignPlan(PlannerInfo *root, RelOptInfo *foreignrel, Oid foreigntablei
 	StringInfoData sql;
 	ListCell   *lc;
 
-	/* every path we create has the base relation as its parent */
-	if (!IS_SIMPLE_REL(foreignrel))
-		elog(ERROR, "trino_fdw: unexpected non-base relation in GetForeignPlan");
-
-	foreach(lc, scan_clauses)
+	if (IS_SIMPLE_REL(foreignrel))
 	{
-		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+		scan_relid = foreignrel->relid;
+		foreach(lc, scan_clauses)
+		{
+			RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
 
-		if (ri->pseudoconstant)
-			continue;
-		if (list_member_ptr(fpinfo->remote_conds, ri))
-			remote_conds = lappend(remote_conds, ri);
-		else if (list_member_ptr(fpinfo->local_conds, ri))
-			local_exprs = lappend(local_exprs, ri->clause);
-		else if (trino_is_foreign_expr(root, foreignrel, ri->clause))
-			remote_conds = lappend(remote_conds, ri);
-		else
-			local_exprs = lappend(local_exprs, ri->clause);
+			if (ri->pseudoconstant)
+				continue;
+			if (list_member_ptr(fpinfo->remote_conds, ri))
+				remote_conds = lappend(remote_conds, ri);
+			else if (list_member_ptr(fpinfo->local_conds, ri))
+				local_exprs = lappend(local_exprs, ri->clause);
+			else if (trino_is_foreign_expr(root, foreignrel, ri->clause))
+				remote_conds = lappend(remote_conds, ri);	/* join clause */
+			else
+				local_exprs = lappend(local_exprs, ri->clause);
+		}
+		foreach(lc, remote_conds)
+			remote_exprs = lappend(remote_exprs, ((RestrictInfo *) lfirst(lc))->clause);
+	}
+	else if (IS_JOIN_REL(foreignrel))
+	{
+		remote_conds = fpinfo->remote_conds;
+		foreach(lc, fpinfo->local_conds)
+			local_exprs = lappend(local_exprs, ((RestrictInfo *) lfirst(lc))->clause);
+		fdw_scan_tlist = build_scan_tlist(foreignrel, local_exprs);
+	}
+	else
+	{
+		/* grouped relation: WHERE and HAVING are found via fpinfo */
+		local_exprs = fpinfo->having_local;
+		fdw_scan_tlist = build_scan_tlist(foreignrel, local_exprs);
 	}
 	if (has_limit && local_exprs != NIL)
 		elog(ERROR, "trino_fdw: LIMIT pushed down with local quals");
 
-	foreach(lc, remote_conds)
-		remote_exprs = lappend(remote_exprs, ((RestrictInfo *) lfirst(lc))->clause);
-
 	initStringInfo(&sql);
-	trino_deparse_select(&sql, root, foreignrel, NIL, remote_conds,
+	trino_deparse_select(&sql, root, foreignrel, fdw_scan_tlist, remote_conds,
 						 pathkeys, has_limit, limit_count, limit_offset,
 						 &retrieved_attrs, &params_list, &param_offsets);
 
-	fdw_private = list_make4(makeString(sql.data),
+	fdw_private = list_make5(makeString(sql.data),
 							 retrieved_attrs,
 							 param_offsets,
-							 makeInteger((int) fpinfo->relid));
+							 makeInteger((int) fpinfo->relid),
+							 makeString(fpinfo->relation_name ?
+										fpinfo->relation_name : ""));
 
-	return make_foreignscan(tlist, local_exprs, foreignrel->relid, params_list,
-							fdw_private, NIL, remote_exprs, outer_plan);
+	return make_foreignscan(tlist, local_exprs, scan_relid, params_list,
+							fdw_private, fdw_scan_tlist, remote_exprs,
+							outer_plan);
 }
 
 /* ----------------------------------------------------------------
@@ -1074,7 +1696,11 @@ trinoExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	char	   *sql = strVal(list_nth(fsplan->fdw_private, TrinoScanPrivateSql));
 	List	   *offsets = (List *) list_nth(fsplan->fdw_private,
 											TrinoScanPrivateParamOffsets);
+	char	   *relations = strVal(list_nth(fsplan->fdw_private,
+											TrinoScanPrivateRelations));
 
+	if (relations[0] != '\0')
+		ExplainPropertyText("Relations", relations, es);
 	ExplainPropertyText("Trino SQL", render_sql(sql, offsets, NIL), es);
 }
 
@@ -1114,10 +1740,14 @@ trinoPlanForeignModify(PlannerInfo *root, ModifyTable *plan,
 	if (plan->operation != CMD_INSERT)
 		ereport(ERROR,
 				(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
-				 errmsg("trino_fdw: %s on a Trino foreign table is not supported",
+				 errmsg("trino_fdw: this %s cannot be sent to Trino as a whole",
 						plan->operation == CMD_UPDATE ? "UPDATE" :
-						plan->operation == CMD_DELETE ? "DELETE" : "this operation"),
-				 errhint("Use trino_execute(server, sql) to run DML directly on Trino.")));
+						plan->operation == CMD_DELETE ? "DELETE" : "statement"),
+				 errdetail("UPDATE and DELETE on a Trino foreign table run entirely on Trino, "
+						   "so the WHERE clause and any new values must be expressions "
+						   "Trino can evaluate, the statement cannot join other tables, "
+						   "and RETURNING and row-level triggers are not supported."),
+				 errhint("Use trino_execute(server, sql) to run arbitrary DML on Trino.")));
 	if (plan->onConflictAction != ONCONFLICT_NONE)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1242,6 +1872,27 @@ trinoExecForeignInsert(EState *estate, ResultRelInfo *rinfo,
 	return slot;
 }
 
+/*
+ * UPDATE and DELETE always run as direct modifications (see
+ * trinoPlanDirectModify); PlanForeignModify rejects anything else at plan
+ * time.  The executor nevertheless requires these entry points to exist.
+ */
+static TupleTableSlot *
+trinoExecForeignUpdate(EState *estate, ResultRelInfo *rinfo,
+					   TupleTableSlot *slot, TupleTableSlot *planSlot)
+{
+	elog(ERROR, "trino_fdw: row-by-row UPDATE is not supported");
+	return NULL;
+}
+
+static TupleTableSlot *
+trinoExecForeignDelete(EState *estate, ResultRelInfo *rinfo,
+					   TupleTableSlot *slot, TupleTableSlot *planSlot)
+{
+	elog(ERROR, "trino_fdw: row-by-row DELETE is not supported");
+	return NULL;
+}
+
 static int
 trinoGetForeignModifyBatchSize(ResultRelInfo *rinfo)
 {
@@ -1273,7 +1924,7 @@ trinoEndForeignInsert(EState *estate, ResultRelInfo *rinfo)
 static int
 trinoIsForeignRelUpdatable(Relation rel)
 {
-	return (1 << CMD_INSERT);
+	return (1 << CMD_INSERT) | (1 << CMD_UPDATE) | (1 << CMD_DELETE);
 }
 
 static void
@@ -1283,6 +1934,255 @@ trinoExplainForeignModify(ModifyTableState *mtstate, ResultRelInfo *rinfo,
 	char	   *prefix = strVal(list_nth(fdw_private, TrinoModifyPrivateSqlPrefix));
 
 	ExplainPropertyText("Trino SQL", psprintf("%s(...)", prefix), es);
+}
+
+/* ----------------------------------------------------------------
+ * Executor: direct UPDATE / DELETE
+ *
+ * Trino has no row identifiers, so UPDATE and DELETE can only be executed
+ * when the whole statement can be sent as one Trino statement.
+ * ---------------------------------------------------------------- */
+
+typedef struct TrinoDirectModifyState
+{
+	TrinoOptions *opts;
+	char	   *sql_template;
+	List	   *param_offsets;
+	List	   *param_exprs;	/* ExprState list */
+	List	   *param_types;	/* Oid list */
+	bool		set_processed;
+	bool		executed;
+	int64		num_tuples;
+} TrinoDirectModifyState;
+
+/*
+ * Assigning to a column of type numeric(10,2) or varchar(5) wraps the new
+ * value in a length-coercion call to the same base type.  Trino applies the
+ * column's precision itself, so the wrapper can go.
+ */
+static Expr *
+strip_typmod_coercion(Expr *expr)
+{
+	for (;;)
+	{
+		if (IsA(expr, FuncExpr))
+		{
+			FuncExpr   *fe = (FuncExpr *) expr;
+
+			if ((fe->funcformat == COERCE_IMPLICIT_CAST ||
+				 fe->funcformat == COERCE_EXPLICIT_CAST) &&
+				list_length(fe->args) >= 1 &&
+				exprType(linitial(fe->args)) == fe->funcresulttype)
+			{
+				expr = (Expr *) linitial(fe->args);
+				continue;
+			}
+		}
+		if (IsA(expr, RelabelType) &&
+			((RelabelType *) expr)->resulttype == exprType((Node *) ((RelabelType *) expr)->arg))
+		{
+			expr = ((RelabelType *) expr)->arg;
+			continue;
+		}
+		return expr;
+	}
+}
+
+static bool
+trinoPlanDirectModify(PlannerInfo *root, ModifyTable *plan, Index resultRelation,
+					  int subplan_index)
+{
+	CmdType		operation = plan->operation;
+	Plan	   *subplan;
+	ForeignScan *fscan;
+	RelOptInfo *foreignrel;
+	RangeTblEntry *rte;
+	Relation	rel;
+	List	   *target_attrs = NIL;
+	List	   *target_exprs = NIL;
+	List	   *params_list;
+	List	   *param_offsets;
+	StringInfoData sql;
+
+	if (operation != CMD_UPDATE && operation != CMD_DELETE)
+		return false;
+	if (plan->returningLists != NIL || plan->withCheckOptionLists != NIL)
+		return false;
+
+	/* the scan feeding the ModifyTable must be a plain scan of the target */
+	subplan = outerPlan(plan);
+	if (subplan == NULL || !IsA(subplan, ForeignScan))
+		return false;
+	fscan = (ForeignScan *) subplan;
+	if (fscan->scan.scanrelid != resultRelation)
+		return false;
+	if (fscan->scan.plan.qual != NIL)
+		return false;			/* local quals: rows must be fetched */
+
+	foreignrel = find_base_rel(root, resultRelation);
+	rte = planner_rt_fetch(resultRelation, root);
+	rel = table_open(rte->relid, NoLock);
+
+	/* row-level triggers need the rows */
+	if (rel->trigdesc &&
+		((operation == CMD_UPDATE &&
+		  (rel->trigdesc->trig_update_before_row ||
+		   rel->trigdesc->trig_update_after_row)) ||
+		 (operation == CMD_DELETE &&
+		  (rel->trigdesc->trig_delete_before_row ||
+		   rel->trigdesc->trig_delete_after_row))))
+	{
+		table_close(rel, NoLock);
+		return false;
+	}
+
+	if (operation == CMD_UPDATE)
+	{
+		ListCell   *lc;
+		ListCell   *lc_col = list_head(root->update_colnos);
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+
+		/* non-junk processed_tlist entries line up with update_colnos */
+		foreach(lc, root->processed_tlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+			AttrNumber	attnum;
+			Expr	   *expr;
+
+			if (tle->resjunk)
+				continue;
+			if (lc_col == NULL)
+				elog(ERROR, "too few entries in update_colnos");
+			attnum = lfirst_int(lc_col);
+			lc_col = lnext(root->update_colnos, lc_col);
+
+			expr = strip_typmod_coercion(tle->expr);
+			if (attnum <= 0 || TupleDescAttr(tupdesc, attnum - 1)->attgenerated ||
+				!trino_is_foreign_expr(root, foreignrel, expr))
+			{
+				table_close(rel, NoLock);
+				return false;
+			}
+			target_attrs = lappend_int(target_attrs, attnum);
+			target_exprs = lappend(target_exprs, expr);
+		}
+	}
+
+	initStringInfo(&sql);
+	trino_deparse_direct_modify(&sql, root, foreignrel, operation, target_attrs,
+								target_exprs, fscan->fdw_recheck_quals,
+								&params_list, &param_offsets);
+	table_close(rel, NoLock);
+
+	/* turn the scan into a direct modification */
+	fscan->operation = operation;
+	fscan->resultRelation = resultRelation;
+	fscan->fdw_exprs = params_list;
+	fscan->fdw_private = list_make4(makeString(sql.data),
+									param_offsets,
+									makeInteger((int) rte->relid),
+									makeInteger(plan->canSetTag ? 1 : 0));
+	fscan->fdw_scan_tlist = NIL;
+	fscan->fdw_recheck_quals = NIL;
+	return true;
+}
+
+static void
+trinoBeginDirectModify(ForeignScanState *node, int eflags)
+{
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	EState	   *estate = node->ss.ps.state;
+	TrinoDirectModifyState *dm;
+	Oid			relid;
+	Oid			userid;
+	ListCell   *lc;
+
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	dm = palloc0(sizeof(TrinoDirectModifyState));
+	node->fdw_state = dm;
+
+	relid = (Oid) intVal(list_nth(fsplan->fdw_private, TrinoDirectPrivateRelid));
+#if PG_VERSION_NUM >= 160000
+	userid = OidIsValid(fsplan->checkAsUser) ? fsplan->checkAsUser : GetUserId();
+#else
+	{
+		RangeTblEntry *rte = exec_rt_fetch(fsplan->resultRelation, estate);
+
+		userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+	}
+#endif
+	dm->opts = trino_get_options(relid, InvalidOid, userid);
+	dm->sql_template = strVal(list_nth(fsplan->fdw_private, TrinoDirectPrivateSql));
+	dm->param_offsets = (List *) list_nth(fsplan->fdw_private,
+										  TrinoDirectPrivateParamOffsets);
+	dm->set_processed = intVal(list_nth(fsplan->fdw_private,
+										TrinoDirectPrivateSetProcessed)) != 0;
+	dm->param_exprs = ExecInitExprList(fsplan->fdw_exprs, (PlanState *) node);
+	foreach(lc, fsplan->fdw_exprs)
+		dm->param_types = lappend_oid(dm->param_types, exprType(lfirst(lc)));
+	dm->num_tuples = -1;
+	(void) estate;
+}
+
+static TupleTableSlot *
+trinoIterateDirectModify(ForeignScanState *node)
+{
+	TrinoDirectModifyState *dm = (TrinoDirectModifyState *) node->fdw_state;
+	EState	   *estate = node->ss.ps.state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	if (!dm->executed)
+	{
+		ExprContext *econtext = node->ss.ps.ps_ExprContext;
+		List	   *values = NIL;
+		ListCell   *lc;
+		ListCell   *tlc;
+		char	   *sql;
+		int64		count;
+
+		forboth(lc, dm->param_exprs, tlc, dm->param_types)
+		{
+			ExprState  *es = (ExprState *) lfirst(lc);
+			StringInfoData buf;
+			bool		isnull;
+			Datum		d;
+
+			d = ExecEvalExpr(es, econtext, &isnull);
+			initStringInfo(&buf);
+			trino_deparse_datum(&buf, d, lfirst_oid(tlc), isnull);
+			values = lappend(values, buf.data);
+		}
+		sql = render_sql(dm->sql_template, dm->param_offsets, values);
+		count = trino_execute_sql(dm->opts, sql);
+		/* a connector that does not report a count gives -1 */
+		dm->num_tuples = count < 0 ? 0 : count;
+		dm->executed = true;
+
+		if (dm->set_processed)
+			estate->es_processed += dm->num_tuples;
+		if (node->ss.ps.instrument)
+			node->ss.ps.instrument->tuplecount += dm->num_tuples;
+	}
+	return ExecClearTuple(slot);
+}
+
+static void
+trinoEndDirectModify(ForeignScanState *node)
+{
+	/* nothing to release: the statement was autocommitted by Trino */
+}
+
+static void
+trinoExplainDirectModify(ForeignScanState *node, ExplainState *es)
+{
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	char	   *sql = strVal(list_nth(fsplan->fdw_private, TrinoDirectPrivateSql));
+	List	   *offsets = (List *) list_nth(fsplan->fdw_private,
+											TrinoDirectPrivateParamOffsets);
+
+	ExplainPropertyText("Trino SQL", render_sql(sql, offsets, NIL), es);
 }
 
 /* ----------------------------------------------------------------

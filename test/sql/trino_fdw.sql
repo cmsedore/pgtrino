@@ -214,11 +214,70 @@ EXPLAIN (COSTS OFF) SELECT k FROM t2 WHERE k = (SELECT 20);
 SELECT k FROM t2 WHERE k = (SELECT 20);
 SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE '%"t2"%' ORDER BY 1;
 
--- joins: no parameterized paths, so the join itself runs locally
-CREATE TABLE local_k (k bigint);
+-- parameterized paths: a nested loop probes Trino once per outer row
+CREATE TABLE local_k (k bigint PRIMARY KEY);
 INSERT INTO local_k VALUES (10), (30);
+ANALYZE local_k;
+SET enable_hashjoin = off; SET enable_mergejoin = off;
+EXPLAIN (COSTS OFF) SELECT l.k, t2.note FROM local_k l JOIN t2 USING (k);
 SELECT l.k, t2.note FROM local_k l JOIN t2 USING (k) ORDER BY 1;
-SELECT a.k, b.k FROM t2 a JOIN t2 b ON a.k < b.k ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT l.k, (SELECT count(*) FROM t2 WHERE t2.k = l.k AND note IS NOT NULL) FROM local_k l;
+SELECT l.k, (SELECT count(*) FROM t2 WHERE t2.k = l.k AND note IS NOT NULL) FROM local_k l ORDER BY 1;
+RESET enable_hashjoin; RESET enable_mergejoin;
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE '%"t2"%' ORDER BY 1;
+
+-- ===================================================================
+-- aggregate pushdown (before ANALYZE: with real statistics on these tiny
+-- tables the local and remote plans cost the same and the tie goes local)
+-- ===================================================================
+CREATE FOREIGN TABLE t1b (id integer, name varchar(10), val double precision) SERVER mock OPTIONS (table_name 't1');
+EXPLAIN (COSTS OFF) SELECT count(*), count(note), sum(k), min(v), max(k), bool_and(k > 0), bool_or(note IS NULL) FROM t2;
+EXPLAIN (COSTS OFF) SELECT avg(val), sum(val), min(id) FROM t1b;
+SELECT avg(val), sum(val), min(id) FROM t1b;
+SELECT count(*), count(note), sum(k), min(v), max(k) FROM t2;
+EXPLAIN (COSTS OFF) SELECT note, count(*) FROM t2 WHERE k > 0 GROUP BY note HAVING count(*) > 0 ORDER BY count(*) DESC LIMIT 5;
+EXPLAIN (COSTS OFF) SELECT k % 2 AS parity, count(DISTINCT note), sum(v) FILTER (WHERE k > 10) FROM t2 GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT k, count(*) + 1, sum(v) * 2 FROM t2 GROUP BY k ORDER BY k;
+SELECT k, count(*) + 1, sum(v) * 2 FROM t2 GROUP BY k ORDER BY k;
+EXPLAIN (COSTS OFF) SELECT b.name, count(a.k), max(a.v) FROM t2 a JOIN t1b b ON a.k = b.id GROUP BY b.name;
+SELECT b.name, count(a.k), max(a.v) FROM t2 a JOIN t1b b ON a.k = b.id GROUP BY b.name ORDER BY 1;
+-- aggregates whose results would differ, or that Trino lacks, stay local
+EXPLAIN (COSTS OFF) SELECT avg(k), avg(v) FROM t2;
+EXPLAIN (COSTS OFF) SELECT min(note), string_agg(note, ',') FROM t2;
+EXPLAIN (COSTS OFF) SELECT array_agg(k ORDER BY k) FROM t2;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM t2 GROUP BY ROLLUP (k);
+EXPLAIN (COSTS OFF) SELECT note, count(*) FROM t2 GROUP BY note HAVING note ~ 'x';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t2 WHERE note ~ 'x';
+EXPLAIN (COSTS OFF) SELECT count(*), k FROM t2 GROUP BY k ORDER BY random();
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE '%count%' ORDER BY 1;
+
+-- ===================================================================
+-- join pushdown
+-- ===================================================================
+ANALYZE t2; ANALYZE t1b;
+EXPLAIN (COSTS OFF) SELECT a.k, b.id FROM t2 a JOIN t1b b ON a.k = b.id WHERE b.val > 1;
+-- the mock joins row-wise and ignores WHERE, so this checks shape and types
+SELECT a.k, b.name FROM t2 a JOIN t1b b ON a.k = b.id ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT a.k, b.id FROM t2 a LEFT JOIN t1b b ON a.k = b.id AND b.val > 1 WHERE a.note IS NOT NULL;
+EXPLAIN (COSTS OFF) SELECT a.k, b.id FROM t2 a RIGHT JOIN t1b b ON a.k = b.id WHERE b.val > 1;
+EXPLAIN (COSTS OFF) SELECT a.k, b.id FROM t2 a FULL JOIN t1b b ON a.k = b.id;
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a FULL JOIN t1b b ON a.k = b.id WHERE b.val IS NULL;
+-- a non-shippable join clause: fine for an inner join, blocks an outer join
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a JOIN t1b b ON a.k = b.id AND a.note ~ b.name;
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a LEFT JOIN t1b b ON a.k = b.id AND a.note ~ b.name;
+-- a non-shippable WHERE clause on the nullable side blocks an outer join
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a LEFT JOIN t1b b ON a.k = b.id WHERE b.name ~ 'x' OR b.name IS NULL;
+-- nested joins, with ORDER BY and LIMIT on top
+EXPLAIN (COSTS OFF) SELECT a.k, b.id, c.k FROM t2 a JOIN t1b b ON a.k = b.id JOIN t2 c ON c.k = b.id + 1 ORDER BY a.k LIMIT 5;
+-- whole-row references and row marks keep the join local
+EXPLAIN (COSTS OFF) SELECT a, b.id FROM t2 a JOIN t1b b ON a.k = b.id;
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a JOIN t1b b ON a.k = b.id FOR UPDATE;
+-- tables on different servers are never joined remotely
+CREATE SERVER mock2 FOREIGN DATA WRAPPER trino_fdw
+  OPTIONS (host '127.0.0.1', port '18080', catalog 'mock', schema 's1');
+CREATE USER MAPPING FOR PUBLIC SERVER mock2 OPTIONS (user 'tester');
+CREATE FOREIGN TABLE t2_other (k bigint) SERVER mock2 OPTIONS (table_name 't2');
+EXPLAIN (COSTS OFF) SELECT a.k FROM t2 a JOIN t2_other b ON a.k = b.k;
 
 -- ===================================================================
 -- INSERT
@@ -238,8 +297,6 @@ INSERT INTO t1 (id, dur) VALUES (3, '1 month 1 day');
 INSERT INTO t1 (id, dur) VALUES (5, '30:00:00'), (6, '-1 day -1 hour');
 INSERT INTO t1 (id, val) VALUES (4, 'NaN');
 SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE 'INSERT%' ORDER BY 1;
-UPDATE t2 SET k = 1;
-DELETE FROM t2;
 INSERT INTO t2 VALUES (1, 1, 'x') ON CONFLICT DO NOTHING;
 CREATE FOREIGN TABLE boom_w (id integer) SERVER mock OPTIONS (table_name 'boom');
 INSERT INTO boom_w VALUES (1);
@@ -247,6 +304,54 @@ INSERT INTO boom_w VALUES (1);
 ALTER FOREIGN TABLE t2 OPTIONS (batch_size '2');
 INSERT INTO t2 SELECT g, NULL, NULL FROM generate_series(1, 5) g;
 SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE 'INSERT INTO "mock"."s1"."t2" ("k", "v", "note") VALUES (%, NULL, NULL)%' ORDER BY 1;
+
+-- ===================================================================
+-- UPDATE and DELETE run as single Trino statements
+-- ===================================================================
+EXPLAIN (COSTS OFF) DELETE FROM t2 WHERE k > 10 AND note LIKE 'a%';
+DELETE FROM t2 WHERE k > 10 AND note LIKE 'a%';
+EXPLAIN (COSTS OFF) UPDATE t2 SET v = v * 2, note = upper(note) WHERE k = 10 OR note IS NULL;
+UPDATE t2 SET v = v * 2, note = upper(note) WHERE k = 10 OR note IS NULL;
+EXPLAIN (COSTS OFF) UPDATE t2 SET k = DEFAULT, v = NULL WHERE k = (SELECT max(k) FROM local_k);
+UPDATE t2 SET k = DEFAULT, v = NULL WHERE k = (SELECT max(k) FROM local_k);
+PREPARE del (bigint) AS DELETE FROM t2 WHERE k = $1;
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE del (7);
+EXECUTE del (7);
+RESET plan_cache_mode;
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) DELETE FROM t2 WHERE k < 0;
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHERE sql LIKE 'UPDATE%' OR sql LIKE 'DELETE%' ORDER BY 1;
+-- anything that needs rows on the PostgreSQL side is rejected
+UPDATE t2 SET note = md5(note) WHERE k = 1;
+UPDATE t2 SET k = k + 1 WHERE note ~ 'x';
+DELETE FROM t2 USING local_k WHERE t2.k = local_k.k;
+UPDATE t2 SET k = 1 WHERE k = 2 RETURNING *;
+CREATE FUNCTION trino_fdw_trg() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';
+CREATE TRIGGER t2_del BEFORE DELETE ON t2 FOR EACH ROW EXECUTE FUNCTION trino_fdw_trg();
+DELETE FROM t2 WHERE k = 1;
+DROP TRIGGER t2_del ON t2;
+CREATE FOREIGN TABLE boom_dml (k bigint) SERVER mock OPTIONS (table_name 'boom');
+DELETE FROM boom_dml WHERE k = 1;
+
+-- ===================================================================
+-- spooled protocol (a second mock answers with segments)
+-- ===================================================================
+CREATE SERVER spool FOREIGN DATA WRAPPER trino_fdw
+  OPTIONS (host '127.0.0.1', port '18081', catalog 'mock', schema 's1');
+CREATE USER MAPPING FOR PUBLIC SERVER spool OPTIONS (user 'tester');
+CREATE FOREIGN TABLE sp_t1 (id integer, name varchar(10), tags text[]) SERVER spool OPTIONS (table_name 't1');
+CREATE FOREIGN TABLE sp_t2 (k bigint, v numeric(10,2)) SERVER spool OPTIONS (table_name 't2');
+SELECT count(*) >= 0 FROM trino_query('spool', 'SELECT sql FROM sqllog') AS t(sql text);
+SELECT * FROM sp_t1 ORDER BY id;
+SELECT * FROM sp_t2 ORDER BY k;
+SELECT k FROM sp_t2 ORDER BY k LIMIT 1;
+-- the spooled segment was fetched and acknowledged
+SELECT sql FROM trino_query('spool', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+-- with spooling off the plain protocol is used
+ALTER SERVER spool OPTIONS (ADD spooling 'false');
+SELECT * FROM sp_t2 ORDER BY k;
+SELECT sql FROM trino_query('spool', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+ALTER SERVER spool OPTIONS (SET spooling 'maybe');
 
 -- ===================================================================
 -- passthrough functions
@@ -280,6 +385,9 @@ SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) WHE
 -- cleanup
 -- ===================================================================
 DROP TABLE local_k;
+DROP FUNCTION trino_fdw_trg();
+DROP SERVER spool CASCADE;
+DROP SERVER mock2 CASCADE;
 DROP SERVER mock CASCADE;
 DROP SERVER nocat CASCADE;
 DROP SERVER nohost CASCADE;

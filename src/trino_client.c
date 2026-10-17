@@ -47,6 +47,11 @@ struct TrinoQuery
 	int			nrows;
 	int			cur;
 
+	/* spooled protocol: segments of the current page still to be read */
+	List	   *segments;
+	CURL	   *seg_curl;		/* separate handle: storage URLs must not
+								 * receive the Trino headers or credentials */
+
 	int64		update_count;
 	bool		closed;
 };
@@ -103,6 +108,11 @@ trino_release_curl(TrinoQuery *q)
 	{
 		curl_easy_cleanup(q->curl);
 		q->curl = NULL;
+	}
+	if (q->seg_curl)
+	{
+		curl_easy_cleanup(q->seg_curl);
+		q->seg_curl = NULL;
 	}
 	if (q->headers)
 	{
@@ -181,6 +191,9 @@ trino_build_headers(TrinoOptions *opts)
 		ADD_HEADER("X-Trino-Session: %s", opts->session_properties);
 	if (opts->client_tags)
 		ADD_HEADER("X-Trino-Client-Tags: %s", opts->client_tags);
+	/* ask for the spooled protocol; servers without spooling ignore this */
+	if (opts->spooling)
+		h = curl_slist_append(h, "X-Trino-Query-Data-Encoding: json");
 	/* without this Trino downgrades every timestamp to millisecond precision */
 	h = curl_slist_append(h, "X-Trino-Client-Capabilities: PARAMETRIC_DATETIME,SESSION_AUTHORIZATION");
 	h = curl_slist_append(h, "Content-Type: text/plain; charset=utf-8");
@@ -417,16 +430,223 @@ trino_process_response(TrinoQuery *q, long status)
 		}
 	}
 
+	q->segments = NIL;
 	v = tj_get(doc, "data");
 	if (v && v->type == TJ_ARRAY)
 	{
 		q->data = v;
 		q->nrows = tj_count(v);
 	}
+	else if (v && v->type == TJ_OBJECT)
+	{
+		/* spooled protocol: {"encoding": "json", "segments": [...]} */
+		const char *encoding = tj_get_string(v, "encoding");
+		TjValue    *segments = tj_get(v, "segments");
+
+		if (encoding == NULL || strcmp(encoding, "json") != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_REPLY_HANDLE),
+					 errmsg("trino_fdw: Trino used the unsupported result encoding \"%s\"",
+							encoding ? encoding : "?")));
+		if (segments && segments->type == TJ_ARRAY)
+		{
+			oldcxt = MemoryContextSwitchTo(q->page_cxt);
+			q->segments = list_copy(segments->elems);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
 
 	v = tj_get(doc, "updateCount");
 	if (v && v->type == TJ_NUMBER)
 		q->update_count = strtoll(v->str, NULL, 10);
+}
+
+/* Install the rows of a decoded segment as the current data page */
+static void
+install_segment_rows(TrinoQuery *q, const char *json, int len)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(q->page_cxt);
+	TjValue    *rows = tj_parse(json, len);
+
+	MemoryContextSwitchTo(oldcxt);
+	if (rows->type != TJ_ARRAY)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_REPLY_HANDLE),
+				 errmsg("trino_fdw: spooled segment did not contain a JSON array")));
+	q->data = rows;
+	q->nrows = tj_count(rows);
+	q->cur = 0;
+}
+
+/* Build a curl header list from a segment's "headers" object */
+static struct curl_slist *
+segment_headers(TjValue *headers)
+{
+	struct curl_slist *h = NULL;
+	ListCell   *lc;
+	StringInfoData buf;
+
+	if (headers == NULL || headers->type != TJ_OBJECT)
+		return NULL;
+	initStringInfo(&buf);
+	foreach(lc, headers->elems)
+	{
+		TjField    *f = (TjField *) lfirst(lc);
+
+		if (f->value->type == TJ_STRING)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%s: %s", f->name, f->value->str);
+			h = curl_slist_append(h, buf.data);
+		}
+		else if (f->value->type == TJ_ARRAY)
+		{
+			ListCell   *lc2;
+
+			foreach(lc2, f->value->elems)
+			{
+				TjValue    *val = (TjValue *) lfirst(lc2);
+
+				if (val->type != TJ_STRING)
+					continue;
+				resetStringInfo(&buf);
+				appendStringInfo(&buf, "%s: %s", f->name, val->str);
+				h = curl_slist_append(h, buf.data);
+			}
+		}
+	}
+	pfree(buf.data);
+	return h;
+}
+
+/*
+ * GET a spooled segment (or its ack URI) with the headers Trino supplied.
+ * Returns the HTTP status; the body is left in q->resp.
+ */
+static long
+segment_http(TrinoQuery *q, const char *url, struct curl_slist *headers, bool quiet)
+{
+	CURLcode	rc;
+	long		status = 0;
+	int			attempt;
+
+	if (q->seg_curl == NULL)
+	{
+		q->seg_curl = curl_easy_init();
+		if (q->seg_curl == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_OUT_OF_MEMORY),
+					 errmsg("trino_fdw: could not create libcurl handle")));
+		curl_easy_setopt(q->seg_curl, CURLOPT_NOSIGNAL, 1L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_WRITEFUNCTION, trino_write_cb);
+		curl_easy_setopt(q->seg_curl, CURLOPT_WRITEDATA, &q->resp);
+		curl_easy_setopt(q->seg_curl, CURLOPT_NOPROGRESS, 0L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_XFERINFOFUNCTION, trino_progress_cb);
+		curl_easy_setopt(q->seg_curl, CURLOPT_FOLLOWLOCATION, 1L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_MAXREDIRS, 5L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_CONNECTTIMEOUT, (long) q->opts->connect_timeout);
+		curl_easy_setopt(q->seg_curl, CURLOPT_TIMEOUT, (long) q->opts->request_timeout);
+		curl_easy_setopt(q->seg_curl, CURLOPT_SSL_VERIFYPEER, q->opts->ssl_verify ? 1L : 0L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_SSL_VERIFYHOST, q->opts->ssl_verify ? 2L : 0L);
+	}
+
+	for (attempt = 0;; attempt++)
+	{
+		resetStringInfo(&q->resp);
+		curl_easy_setopt(q->seg_curl, CURLOPT_URL, url);
+		curl_easy_setopt(q->seg_curl, CURLOPT_HTTPGET, 1L);
+		curl_easy_setopt(q->seg_curl, CURLOPT_HTTPHEADER, headers);
+		rc = curl_easy_perform(q->seg_curl);
+
+		if (rc == CURLE_ABORTED_BY_CALLBACK)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (attempt < 3)
+				continue;		/* benign interrupt: GET is idempotent */
+		}
+		if (rc != CURLE_OK)
+		{
+			if (quiet)
+				return -1;
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_ESTABLISH_CONNECTION),
+					 errmsg("trino_fdw: fetching spooled result segment from %s failed: %s",
+							url, curl_easy_strerror(rc)),
+					 errhint("The PostgreSQL server must be able to reach the storage Trino "
+							 "spools results to; otherwise set the server option spooling 'false'.")));
+		}
+		curl_easy_getinfo(q->seg_curl, CURLINFO_RESPONSE_CODE, &status);
+		return status;
+	}
+}
+
+/*
+ * Make the next segment of the current page the current data: inline
+ * segments carry base64 JSON, spooled ones live in object storage.
+ */
+static void
+load_next_segment(TrinoQuery *q)
+{
+	TjValue    *seg = (TjValue *) linitial(q->segments);
+	const char *type = tj_get_string(seg, "type");
+
+	q->segments = list_delete_first(q->segments);
+
+	if (type && strcmp(type, "inline") == 0)
+	{
+		const char *b64 = tj_get_string(seg, "data");
+		int			srclen;
+		int			dstlen;
+		char	   *raw;
+		int			n;
+
+		if (b64 == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_REPLY_HANDLE),
+					 errmsg("trino_fdw: inline result segment has no data")));
+		srclen = strlen(b64);
+		dstlen = pg_b64_dec_len(srclen);
+		raw = MemoryContextAlloc(q->page_cxt, dstlen + 1);
+		n = pg_b64_decode(b64, srclen, raw, dstlen);
+		if (n < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_REPLY_HANDLE),
+					 errmsg("trino_fdw: inline result segment is not valid base64")));
+		install_segment_rows(q, raw, n);
+	}
+	else if (type && strcmp(type, "spooled") == 0)
+	{
+		const char *uri = tj_get_string(seg, "uri");
+		const char *ack_uri = tj_get_string(seg, "ackUri");
+		struct curl_slist *headers = segment_headers(tj_get(seg, "headers"));
+		long		status;
+
+		if (uri == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_REPLY_HANDLE),
+					 errmsg("trino_fdw: spooled result segment has no uri")));
+		status = segment_http(q, uri, headers, false);
+		if (status != 200)
+		{
+			curl_slist_free_all(headers);
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_UNABLE_TO_CREATE_EXECUTION),
+					 errmsg("trino_fdw: fetching spooled result segment returned HTTP status %ld",
+							status),
+					 errdetail("%s", pnstrdup(q->resp.data, Min(q->resp.len, 500)))));
+		}
+		install_segment_rows(q, q->resp.data, q->resp.len);
+
+		/* tell Trino the segment can be deleted; failure only delays that */
+		if (ack_uri)
+			(void) segment_http(q, ack_uri, headers, true);
+		curl_slist_free_all(headers);
+	}
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_REPLY_HANDLE),
+				 errmsg("trino_fdw: unknown result segment type \"%s\"",
+						type ? type : "?")));
 }
 
 /*
@@ -482,6 +702,12 @@ trino_query_fetch_row(TrinoQuery *q)
 
 		if (q->data && q->cur < q->nrows)
 			return tj_nth(q->data, q->cur++);
+
+		if (q->segments != NIL)
+		{
+			load_next_segment(q);
+			continue;
+		}
 
 		if (q->next_uri == NULL)
 			return NULL;

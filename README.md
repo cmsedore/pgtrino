@@ -32,14 +32,27 @@ Java, no Python bridge.
   common functions, and typed literals for numbers, strings, dates, times,
   timestamps, UUIDs and binary data. Anything else is evaluated locally, so
   pushdown never changes results.
+* **Join pushdown.** Inner, left, right and full joins between tables on the
+  same server run as one Trino query, including nested joins, with WHERE and
+  ON conditions placed where their semantics require.
+* **Aggregate pushdown.** `count`, `sum`, `min`, `max`, `avg` (over doubles),
+  `bool_and`/`bool_or`, with `DISTINCT` and `FILTER`, plus `GROUP BY` and
+  `HAVING`, are computed by Trino, also on top of a pushed-down join.
 * **ORDER BY, LIMIT and OFFSET pushdown**, including `ORDER BY ... LIMIT n`
   which Trino executes as a cheap TopN. Collation-dependent text ordering is
   deliberately kept local.
-* **Query parameters.** Prepared-statement parameters and sub-select results
-  are sent as literals at execution time.
+* **Query parameters and parameterized paths.** Prepared-statement
+  parameters and sub-select results are sent as literals at execution time,
+  and a nested loop with a small local outer table can probe Trino once per
+  outer row (`WHERE t.k = $1`) instead of fetching the whole table.
 * **`IMPORT FOREIGN SCHEMA`** with a full Trino → PostgreSQL type mapping.
 * **INSERT** (including `COPY ... FROM` and `INSERT ... RETURNING`), batched
   into multi-row `INSERT ... VALUES` statements.
+* **UPDATE and DELETE**, executed as single Trino statements when the whole
+  statement can be expressed in Trino (connector permitting).
+* **Spooled client protocol.** Large results are fetched as segments from
+  the object storage Trino spools them to, when the server has spooling
+  enabled, with acknowledgement so Trino can prune them early.
 * **`ANALYZE`** on foreign tables, sampling with `TABLESAMPLE BERNOULLI`.
 * **`EXPLAIN`** shows the exact Trino SQL that will run.
 * **Passthrough functions** `trino_query()` and `trino_execute()` for
@@ -97,9 +110,10 @@ CREATE SERVER trino FOREIGN DATA WRAPPER trino_fdw OPTIONS (
 | `source` | `trino_fdw` | Value of the `X-Trino-Source` header (shows up in Trino's query history) |
 | `session_properties` | — | Comma-separated `name=value` list sent as `X-Trino-Session` |
 | `client_tags` | — | Comma-separated list sent as `X-Trino-Client-Tags` (resource groups) |
+| `spooling` | `true` | Request the spooled client protocol; see below |
 | `connect_timeout` | `10` | Seconds to wait when connecting |
 | `request_timeout` | `0` | Seconds a single HTTP request may take (0 = unlimited) |
-| `startup_cost` | `1000` | Planner cost of starting a Trino query |
+| `startup_cost` | `100` | Planner cost of starting a Trino query |
 | `tuple_cost` | `0.2` | Planner cost per row transferred |
 | `default_rows` | `10000` | Row estimate for tables that have not been `ANALYZE`d |
 | `batch_size` | `500` | Rows per `INSERT` statement sent to Trino |
@@ -214,14 +228,34 @@ Pushed to Trino when all operands are of supported types:
   `real` → `double precision`); all other casts stay local
 * `ORDER BY` on numeric, date/time and boolean columns; `LIMIT`/`OFFSET`
   with constant values when every WHERE clause was pushed down
+* Joins (`INNER`, `LEFT`, `RIGHT`, `FULL`) between foreign tables of the same
+  server when all join conditions are shippable; WHERE conditions that are
+  not shippable can still be evaluated locally after an inner join. Joins
+  are kept local when a whole-row reference is needed, for `SELECT ... FOR
+  UPDATE`, and when the query is an UPDATE/DELETE joining the table.
+* Aggregates: `count(*)`, `count(x)`, `sum`, `min`, `max` (numbers, dates,
+  times, timestamps), `avg(double precision)`, `bool_and`, `bool_or`,
+  `every`, each with optional `DISTINCT` and `FILTER (WHERE ...)`;
+  `GROUP BY` on shippable expressions; `HAVING`. An aggregate whose result
+  type or rounding would differ (`avg` over integers or numerics, `min`/`max`
+  over text) keeps the whole aggregation local.
+
+```
+EXPLAIN (COSTS OFF) SELECT c.mktsegment, count(*) FROM customer c JOIN orders o ON o.custkey = c.custkey GROUP BY 1 ORDER BY 2 DESC LIMIT 3;
+ Foreign Scan
+   Relations: Aggregate on ((public.customer c) INNER JOIN (public.orders o))
+   Trino SQL: SELECT r1."mktsegment", count(*) FROM ("tpch"."tiny"."customer" r1 INNER JOIN "tpch"."tiny"."orders" r2 ON (r1."custkey" = r2."custkey")) GROUP BY r1."mktsegment" ORDER BY count(*) DESC NULLS FIRST LIMIT 3
+```
 
 Kept local on purpose: anything involving mutable functions (`now()`,
 `random()`), regular expressions, `ILIKE`, text ordering (collations differ),
 infinite dates/timestamps, `numeric` `NaN`, dates BC, user-defined operators
-and functions, aggregates, joins and window functions.
+and functions, grouping sets, ordered-set and `ORDER BY` aggregates,
+`string_agg`/`array_agg`, window functions, and semi/anti joins.
 
-Aggregates and joins are computed in PostgreSQL after fetching the rows they
-need. When that is too slow, let Trino do the work with `trino_query()`.
+Pushdown decisions are cost based, like any other plan choice. Run `ANALYZE`
+on the foreign tables so the planner knows their sizes: without statistics
+a join is assumed to produce many rows and may be done locally.
 
 ## Writing data
 
@@ -231,10 +265,23 @@ INSERT INTO orders SELECT ... ;          -- sent in batches of batch_size rows
 COPY orders FROM '/tmp/orders.csv' CSV;  -- also batched
 ```
 
-Each batch is one autocommitted Trino `INSERT`. **Rolling back the PostgreSQL
-transaction does not undo rows already sent to Trino.** `UPDATE`, `DELETE` and
-`INSERT ... ON CONFLICT` on foreign tables are rejected; use
-`trino_execute()` for DML Trino supports.
+```sql
+UPDATE orders SET total = total * 1.1, note = upper(note) WHERE placed_at < DATE '2020-01-01';
+DELETE FROM orders WHERE customer IS NULL OR id IN (1, 2, 3);
+```
+
+Trino has no row identifiers, so `UPDATE` and `DELETE` only work when the
+whole statement can be sent to Trino as one `UPDATE`/`DELETE`: the `WHERE`
+clause and the new values must be shippable expressions (parameters and
+sub-selects are fine), the statement cannot join other tables, and
+`RETURNING` and row-level triggers are not supported. Anything else is
+rejected with an explanatory error. The connector behind the table must
+support row-level modification (Iceberg, Delta Lake, Hive ACID, ...); the row
+count reported is whatever Trino reports.
+
+Each statement and each INSERT batch is one autocommitted Trino query.
+**Rolling back the PostgreSQL transaction does not undo changes already sent
+to Trino.** `INSERT ... ON CONFLICT` is rejected.
 
 Trino intervals have millisecond precision, so microseconds in inserted
 `interval` values are truncated.
@@ -261,6 +308,20 @@ user mapping.
 query on Trino and stores regular PostgreSQL statistics, which the planner
 then uses for row estimates. Until then the `default_rows` option is used.
 
+## Spooled protocol
+
+By default the FDW asks for Trino's spooled client protocol
+(`X-Trino-Query-Data-Encoding: json`). On a server with spooling enabled,
+large results arrive as segments: small ones inline, large ones written by
+Trino to object storage and fetched by the FDW directly from there (with the
+headers Trino supplies), then acknowledged so Trino can delete them. Servers
+without spooling simply answer with the classic inline protocol.
+
+This means that **the PostgreSQL server must be able to reach the storage
+Trino spools to** (or the coordinator, when Trino is configured with
+`protocol.spooling.retrieval-mode=COORDINATOR_PROXY`). If it cannot, set
+`spooling 'false'` on the server. Compressed encodings are not requested.
+
 ## Security notes
 
 * With `ssl 'false'` everything, including the `X-Trino-User` header, travels
@@ -282,15 +343,21 @@ usual `PG*` environment variables:
 test/run_tests.sh          # starts the mock, runs `make installcheck`
 ```
 
+The regression runner starts a second mock instance that answers with
+spooled-protocol segments, so that code path is covered without object
+storage.
+
 `test/integration.sh` runs end-to-end checks against a real Trino with the
 `tpch` and `memory` catalogs (for example `docker run -p 8080:8080
-trinodb/trino`). The GitHub Actions workflow runs the regression suite on
-PostgreSQL 14–17 and the integration script against Trino 476.
+trinodb/trino`); when the server also has an `iceberg` catalog the
+UPDATE/DELETE checks run too. The GitHub Actions workflow runs the regression
+suite on PostgreSQL 14–17 and the integration script against Trino 476.
 
-## Limitations and ideas for later
+## Limitations
 
-* No join, aggregate or parameterized-path pushdown yet.
-* No `UPDATE`/`DELETE`, no transactions spanning Trino statements.
-* The Trino spooled client protocol is not used; results are streamed inline
-  as JSON pages, which is fine for the row counts a PostgreSQL query usually
-  pulls but not ideal for bulk extraction of very large tables.
+* No transactions spanning Trino statements; every statement autocommits.
+* Semi and anti joins (`EXISTS`, `IN (subquery)`) and window functions are
+  evaluated locally.
+* `UPDATE`/`DELETE` need the whole statement to be shippable, as described
+  above.
+* Compressed spooling encodings (`json+zstd`, `json+lz4`) are not used.

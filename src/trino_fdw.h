@@ -81,6 +81,7 @@ typedef struct TrinoOptions
 	char	   *schema;
 	char	   *session_properties;
 	char	   *client_tags;
+	bool		spooling;		/* ask for the spooled protocol */
 	int			connect_timeout;	/* seconds */
 	int			request_timeout;	/* seconds, 0 = none */
 
@@ -137,18 +138,43 @@ typedef struct TrinoRelationInfo
 	Cost		rel_startup_cost;
 	Cost		rel_total_cost;
 
-	/* upper relations (ORDER BY / LIMIT pushdown) */
-	RelOptInfo *outerrel;		/* the base rel this upper rel scans */
+	/*
+	 * Join relations: the two inputs, the join type and the clauses that go
+	 * into the ON clause.  remote_conds/local_conds hold WHERE-level clauses.
+	 */
+	RelOptInfo *outerrel;		/* join: outer input; grouped/ordered rel:
+								 * the input relation being scanned */
+	RelOptInfo *innerrel;
+	JoinType	jointype;
+	List	   *joinclauses;	/* RestrictInfos */
+
+	/* grouped relations (aggregate pushdown) */
+	bool		is_grouped;
+	List	   *grouped_tlist;	/* what to SELECT: group exprs and Aggrefs */
+	List	   *having_remote;	/* Expr list sent as HAVING */
+	List	   *having_local;	/* Expr list evaluated locally */
+
+	/* ORDER BY / LIMIT pushdown, carried in a path's fdw_private */
 	List	   *pathkeys;		/* pushed-down ORDER BY, or NIL */
 	bool		has_limit;
 	Node	   *limit_count;
 	Node	   *limit_offset;
+
+	char	   *relation_name;	/* EXPLAIN "Relations:" for joins/aggregates */
 } TrinoRelationInfo;
 
-extern bool trino_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel,
+extern bool trino_is_foreign_expr(PlannerInfo *root, RelOptInfo *rel,
 								  Expr *expr);
-extern bool trino_is_sortable_pathkey(PlannerInfo *root, RelOptInfo *baserel,
+extern bool trino_is_sortable_pathkey(PlannerInfo *root, RelOptInfo *rel,
 									  PathKey *pathkey);
+extern bool trino_is_foreign_param(PlannerInfo *root, RelOptInfo *rel,
+								   Expr *expr);
+extern void trino_deparse_direct_modify(StringInfo buf, PlannerInfo *root,
+										RelOptInfo *rel, CmdType operation,
+										List *target_attrs, List *target_exprs,
+										List *remote_exprs, List **params_list,
+										List **param_offsets);
+extern char *trino_relation_name(PlannerInfo *root, RelOptInfo *rel);
 extern void trino_deparse_select(StringInfo buf, PlannerInfo *root,
 								 RelOptInfo *foreignrel, List *tlist,
 								 List *remote_conds, List *pathkeys,

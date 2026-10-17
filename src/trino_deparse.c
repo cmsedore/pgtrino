@@ -16,6 +16,7 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "commands/defrem.h"
 #include "catalog/pg_collation.h"
@@ -45,7 +46,9 @@
 typedef struct deparse_cxt
 {
 	PlannerInfo *root;
-	RelOptInfo *foreignrel;
+	Relids		relids;			/* base rels whose columns are local to the
+								 * statement being built */
+	bool		qualify;		/* prefix columns with r<varno>. (joins) */
 	StringInfo	buf;
 	List	  **params_list;	/* Param/outer-Var exprs, in order */
 	List	  **param_offsets;	/* byte offsets in buf for each */
@@ -54,12 +57,31 @@ typedef struct deparse_cxt
 typedef struct walker_cxt
 {
 	PlannerInfo *root;
-	RelOptInfo *foreignrel;
+	Relids		relids;
+	bool		allow_aggs;		/* grouped relation: Aggrefs are fine */
 } walker_cxt;
 
 static bool foreign_expr_walker(Node *node, walker_cxt *cxt);
 static void deparse_expr(Node *node, deparse_cxt *cxt);
 static bool try_deparse_datum(StringInfo buf, Datum value, Oid type);
+static void deparse_from(deparse_cxt *cxt, RelOptInfo *rel);
+
+/*
+ * The base relations whose columns an expression may reference when it is
+ * evaluated as part of a scan of rel.  For a grouped relation that is the
+ * input relation being aggregated.
+ */
+static Relids
+rel_relids(RelOptInfo *rel)
+{
+	if (IS_UPPER_REL(rel))
+	{
+		TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+
+		return rel_relids(fpinfo->outerrel);
+	}
+	return rel->relids;
+}
 
 /* ----------------------------------------------------------------
  * Type and operator classification
@@ -316,6 +338,41 @@ trino_function_name(const char *pgname, int nargs, List *argtypes)
 	return NULL;
 }
 
+/*
+ * Map a whitelisted aggregate to its Trino name, or NULL.  Only aggregates
+ * whose result type and semantics match are accepted; e.g. avg() over
+ * integers returns numeric here but double in Trino, so it stays local.
+ */
+static const char *
+trino_aggregate_name(const char *pgname, bool aggstar, List *argtypes)
+{
+	Oid			t0 = argtypes ? linitial_oid(argtypes) : InvalidOid;
+
+	if (strcmp(pgname, "count") == 0)
+	{
+		if (aggstar)
+			return "count";
+		if (list_length(argtypes) == 1 && trino_type_is_deparsable(t0))
+			return "count";
+		return NULL;
+	}
+	if (list_length(argtypes) != 1)
+		return NULL;
+	if (strcmp(pgname, "sum") == 0 && type_is_numeric(t0))
+		return "sum";
+	if ((strcmp(pgname, "min") == 0 || strcmp(pgname, "max") == 0) &&
+		type_is_sortable(t0) && t0 != BOOLOID)
+		return pgname;
+	if (strcmp(pgname, "avg") == 0 && t0 == FLOAT8OID)
+		return "avg";
+	if ((strcmp(pgname, "bool_and") == 0 || strcmp(pgname, "every") == 0) &&
+		t0 == BOOLOID)
+		return "bool_and";
+	if (strcmp(pgname, "bool_or") == 0 && t0 == BOOLOID)
+		return "bool_or";
+	return NULL;
+}
+
 /* ----------------------------------------------------------------
  * Pushdown safety check
  * ---------------------------------------------------------------- */
@@ -324,7 +381,7 @@ static bool
 is_foreign_var(Var *var, walker_cxt *cxt)
 {
 	return var->varlevelsup == 0 &&
-		bms_is_member(var->varno, cxt->foreignrel->relids) &&
+		bms_is_member(var->varno, cxt->relids) &&
 		var->varattno > 0;
 }
 
@@ -346,8 +403,8 @@ foreign_expr_walker(Node *node, walker_cxt *cxt)
 					 * A Var from another relation (a parameterized path)
 					 * becomes a runtime parameter, like postgres_fdw.
 					 */
-					if (var->varlevelsup == 0 &&
-						!bms_is_member(var->varno, cxt->foreignrel->relids))
+					if (var->varlevelsup == 0 && var->varattno > 0 &&
+						!bms_is_member(var->varno, cxt->relids))
 						return trino_type_is_deparsable(var->vartype);
 					return false;
 				}
@@ -527,6 +584,52 @@ foreign_expr_walker(Node *node, walker_cxt *cxt)
 					return false;
 				return foreign_expr_walker((Node *) fe->args, cxt);
 			}
+		case T_Aggref:
+			{
+				Aggref	   *agg = (Aggref *) node;
+				char	   *name;
+				List	   *argtypes = NIL;
+				ListCell   *lc;
+				walker_cxt	inner = *cxt;
+
+				if (!cxt->allow_aggs)
+					return false;
+				if (agg->aggsplit != AGGSPLIT_SIMPLE ||
+					agg->aggkind != AGGKIND_NORMAL ||
+					agg->aggorder != NIL || agg->aggdirectargs != NIL ||
+					agg->aggvariadic)
+					return false;
+				if (agg->aggdistinct != NIL && list_length(agg->args) != 1)
+					return false;
+				name = pg_catalog_funcname(agg->aggfnoid);
+				if (name == NULL)
+					return false;
+				foreach(lc, agg->args)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+					if (tle->resjunk)
+						return false;
+					argtypes = lappend_oid(argtypes, exprType((Node *) tle->expr));
+				}
+				if (trino_aggregate_name(name, agg->aggstar, argtypes) == NULL)
+					return false;
+				if (!trino_type_is_deparsable(agg->aggtype))
+					return false;
+				/* no nested aggregates inside the arguments or the filter */
+				inner.allow_aggs = false;
+				foreach(lc, agg->args)
+				{
+					TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+					if (!foreign_expr_walker((Node *) tle->expr, &inner))
+						return false;
+				}
+				if (agg->aggfilter &&
+					!foreign_expr_walker((Node *) agg->aggfilter, &inner))
+					return false;
+				return true;
+			}
 		case T_List:
 			{
 				ListCell   *lc;
@@ -542,15 +645,17 @@ foreign_expr_walker(Node *node, walker_cxt *cxt)
 }
 
 /*
- * Can this expression be evaluated by Trino with identical results?
+ * Can this expression be evaluated by Trino with identical results, as part
+ * of a scan of rel (a base, join or grouped relation)?
  */
 bool
-trino_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
+trino_is_foreign_expr(PlannerInfo *root, RelOptInfo *rel, Expr *expr)
 {
 	walker_cxt	cxt;
 
 	cxt.root = root;
-	cxt.foreignrel = baserel;
+	cxt.relids = rel_relids(rel);
+	cxt.allow_aggs = IS_UPPER_REL(rel);
 
 	if (!foreign_expr_walker((Node *) expr, &cxt))
 		return false;
@@ -563,12 +668,33 @@ trino_is_foreign_expr(PlannerInfo *root, RelOptInfo *baserel, Expr *expr)
 }
 
 /*
- * Find the Var of the foreign rel that a pathkey sorts by, or NULL.
+ * Is this expression one that must be sent as a parameter: a Param or a
+ * Var of some other relation?  (Used to classify join clause arguments.)
  */
-static Var *
-pathkey_var(PlannerInfo *root, RelOptInfo *baserel, PathKey *pathkey)
+bool
+trino_is_foreign_param(PlannerInfo *root, RelOptInfo *rel, Expr *expr)
+{
+	if (IsA(expr, Param))
+		return true;
+	if (IsA(expr, Var))
+	{
+		Var		   *var = (Var *) expr;
+
+		return var->varlevelsup == 0 &&
+			!bms_is_member(var->varno, rel_relids(rel));
+	}
+	return false;
+}
+
+/*
+ * Find the expression of rel that a pathkey sorts by, or NULL if the sort
+ * cannot be expressed as a Trino ORDER BY with identical results.
+ */
+static Expr *
+pathkey_expr(PlannerInfo *root, RelOptInfo *rel, PathKey *pathkey)
 {
 	EquivalenceClass *ec = pathkey->pk_eclass;
+	Relids		relids = rel_relids(rel);
 	ListCell   *lc;
 
 	if (ec->ec_has_volatile)
@@ -578,35 +704,36 @@ pathkey_var(PlannerInfo *root, RelOptInfo *baserel, PathKey *pathkey)
 	{
 		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
 		Expr	   *expr = em->em_expr;
+		Oid			type;
+		Oid			opclass;
 
-		if (!bms_equal(em->em_relids, baserel->relids))
+		if (em->em_is_child || em->em_is_const)
+			continue;
+		if (!bms_is_subset(em->em_relids, relids))
 			continue;
 		while (IsA(expr, RelabelType))
 			expr = ((RelabelType *) expr)->arg;
-		if (IsA(expr, Var))
-		{
-			Var		   *var = (Var *) expr;
-			Oid			opclass;
-
-			if (var->varlevelsup == 0 && var->varattno > 0 &&
-				type_is_sortable(var->vartype) &&
-				!type_is_collatable(var->vartype))
-			{
-				/* only the type's default btree ordering maps to ASC/DESC */
-				opclass = GetDefaultOpClass(var->vartype, BTREE_AM_OID);
-				if (OidIsValid(opclass) &&
-					get_opclass_family(opclass) == pathkey->pk_opfamily)
-					return var;
-			}
-		}
+		/* plain columns, or aggregates when sorting a grouped relation */
+		if (!IsA(expr, Var) && !(IsA(expr, Aggref) && IS_UPPER_REL(rel)))
+			continue;
+		type = exprType((Node *) expr);
+		if (!type_is_sortable(type) || type_is_collatable(type))
+			continue;
+		if (!trino_is_foreign_expr(root, rel, expr))
+			continue;
+		/* only the type's default btree ordering maps to ASC/DESC */
+		opclass = GetDefaultOpClass(type, BTREE_AM_OID);
+		if (OidIsValid(opclass) &&
+			get_opclass_family(opclass) == pathkey->pk_opfamily)
+			return expr;
 	}
 	return NULL;
 }
 
 bool
-trino_is_sortable_pathkey(PlannerInfo *root, RelOptInfo *baserel, PathKey *pathkey)
+trino_is_sortable_pathkey(PlannerInfo *root, RelOptInfo *rel, PathKey *pathkey)
 {
-	return pathkey_var(root, baserel, pathkey) != NULL;
+	return pathkey_expr(root, rel, pathkey) != NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -979,11 +1106,12 @@ trino_get_column_name(Oid relid, AttrNumber attnum)
 static void
 deparse_var(Var *var, deparse_cxt *cxt)
 {
-	if (bms_is_member(var->varno, cxt->foreignrel->relids) &&
-		var->varlevelsup == 0)
+	if (bms_is_member(var->varno, cxt->relids) && var->varlevelsup == 0)
 	{
 		RangeTblEntry *rte = planner_rt_fetch(var->varno, cxt->root);
 
+		if (cxt->qualify)
+			appendStringInfo(cxt->buf, "r%d.", var->varno);
 		trino_quote_identifier(cxt->buf, trino_get_column_name(rte->relid, var->varattno));
 	}
 	else
@@ -1141,10 +1269,50 @@ deparse_func_expr(FuncExpr *fe, deparse_cxt *cxt)
 }
 
 static void
+deparse_aggref(Aggref *agg, deparse_cxt *cxt)
+{
+	char	   *pgname = pg_catalog_funcname(agg->aggfnoid);
+	List	   *argtypes = NIL;
+	ListCell   *lc;
+	bool		first = true;
+
+	foreach(lc, agg->args)
+		argtypes = lappend_oid(argtypes, exprType((Node *) ((TargetEntry *) lfirst(lc))->expr));
+
+	appendStringInfo(cxt->buf, "%s(", trino_aggregate_name(pgname, agg->aggstar, argtypes));
+	if (agg->aggstar)
+		appendStringInfoChar(cxt->buf, '*');
+	else
+	{
+		if (agg->aggdistinct)
+			appendStringInfoString(cxt->buf, "DISTINCT ");
+		foreach(lc, agg->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+			if (!first)
+				appendStringInfoString(cxt->buf, ", ");
+			first = false;
+			deparse_expr((Node *) tle->expr, cxt);
+		}
+	}
+	appendStringInfoChar(cxt->buf, ')');
+	if (agg->aggfilter)
+	{
+		appendStringInfoString(cxt->buf, " FILTER (WHERE ");
+		deparse_expr((Node *) agg->aggfilter, cxt);
+		appendStringInfoChar(cxt->buf, ')');
+	}
+}
+
+static void
 deparse_expr(Node *node, deparse_cxt *cxt)
 {
 	switch (nodeTag(node))
 	{
+		case T_Aggref:
+			deparse_aggref((Aggref *) node, cxt);
+			break;
 		case T_Var:
 			deparse_var((Var *) node, cxt);
 			break;
@@ -1279,17 +1447,17 @@ trino_deparse_relation(StringInfo buf, Relation rel, TrinoOptions *opts)
 }
 
 static void
-deparse_target_list(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
-					List *tlist, Relation rel, Bitmapset *attrs_used,
-					List **retrieved_attrs, deparse_cxt *cxt)
+deparse_target_list(deparse_cxt *cxt, RelOptInfo *rel, List *tlist,
+					List **retrieved_attrs)
 {
+	StringInfo	buf = cxt->buf;
 	bool		first = true;
 
 	*retrieved_attrs = NIL;
 
 	if (tlist != NIL)
 	{
-		/* upper relation: each entry is a Var of the base rel */
+		/* join or grouped relation: each entry is an expression to fetch */
 		ListCell   *lc;
 		int			i = 0;
 
@@ -1306,9 +1474,12 @@ deparse_target_list(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	}
 	else
 	{
-		TupleDesc	tupdesc = RelationGetDescr(rel);
+		TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, cxt->root);
+		Relation	relation = table_open(rte->relid, NoLock);
+		TupleDesc	tupdesc = RelationGetDescr(relation);
 		bool		whole_row = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
-											  attrs_used);
+											  fpinfo->attrs_used);
 		int			i;
 
 		for (i = 1; i <= tupdesc->natts; i++)
@@ -1318,25 +1489,114 @@ deparse_target_list(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 			if (attr->attisdropped)
 				continue;
 			if (whole_row ||
-				bms_is_member(i - FirstLowInvalidHeapAttributeNumber, attrs_used))
+				bms_is_member(i - FirstLowInvalidHeapAttributeNumber, fpinfo->attrs_used))
 			{
 				if (!first)
 					appendStringInfoString(buf, ", ");
 				first = false;
-				trino_quote_identifier(buf, trino_get_column_name(RelationGetRelid(rel), i));
+				trino_quote_identifier(buf, trino_get_column_name(rte->relid, i));
 				*retrieved_attrs = lappend_int(*retrieved_attrs, i);
 			}
 		}
+		table_close(relation, NoLock);
 	}
 
 	if (first)
 		appendStringInfoString(buf, "1");	/* no columns needed */
 }
 
-static void
-deparse_pathkeys(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
-				 List *pathkeys, deparse_cxt *cxt)
+static const char *
+join_type_name(JoinType jointype)
 {
+	switch (jointype)
+	{
+		case JOIN_INNER:
+			return "INNER";
+		case JOIN_LEFT:
+			return "LEFT";
+		case JOIN_RIGHT:
+			return "RIGHT";
+		case JOIN_FULL:
+			return "FULL";
+		default:
+			elog(ERROR, "trino_fdw: unsupported join type %d", (int) jointype);
+			return NULL;
+	}
+}
+
+/*
+ * FROM clause for a base or join relation.  Base relations get the alias
+ * r<varno> when columns need qualification.
+ */
+static void
+deparse_from(deparse_cxt *cxt, RelOptInfo *rel)
+{
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+	StringInfo	buf = cxt->buf;
+
+	if (IS_SIMPLE_REL(rel))
+	{
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, cxt->root);
+		Relation	relation = table_open(rte->relid, NoLock);
+
+		trino_deparse_relation(buf, relation, fpinfo->opts);
+		table_close(relation, NoLock);
+		if (cxt->qualify)
+			appendStringInfo(buf, " r%d", rel->relid);
+		return;
+	}
+
+	appendStringInfoChar(buf, '(');
+	deparse_from(cxt, fpinfo->outerrel);
+	appendStringInfo(buf, " %s JOIN ", join_type_name(fpinfo->jointype));
+	deparse_from(cxt, fpinfo->innerrel);
+	appendStringInfoString(buf, " ON ");
+	if (fpinfo->joinclauses == NIL)
+		appendStringInfoString(buf, "TRUE");
+	else
+	{
+		ListCell   *lc;
+		bool		first = true;
+
+		foreach(lc, fpinfo->joinclauses)
+		{
+			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+			if (!first)
+				appendStringInfoString(buf, " AND ");
+			first = false;
+			deparse_expr((Node *) ri->clause, cxt);
+		}
+	}
+	appendStringInfoChar(buf, ')');
+}
+
+static void
+deparse_conds(deparse_cxt *cxt, List *rinfos, const char *keyword)
+{
+	ListCell   *lc;
+	bool		first = true;
+
+	if (rinfos == NIL)
+		return;
+	appendStringInfo(cxt->buf, " %s ", keyword);
+	foreach(lc, rinfos)
+	{
+		Node	   *clause = (Node *) lfirst(lc);
+
+		if (IsA(clause, RestrictInfo))
+			clause = (Node *) ((RestrictInfo *) clause)->clause;
+		if (!first)
+			appendStringInfoString(cxt->buf, " AND ");
+		first = false;
+		deparse_expr(clause, cxt);
+	}
+}
+
+static void
+deparse_pathkeys(deparse_cxt *cxt, RelOptInfo *rel, List *pathkeys)
+{
+	StringInfo	buf = cxt->buf;
 	ListCell   *lc;
 	bool		first = true;
 
@@ -1344,15 +1604,15 @@ deparse_pathkeys(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 	foreach(lc, pathkeys)
 	{
 		PathKey    *pk = (PathKey *) lfirst(lc);
-		Var		   *var = pathkey_var(root, baserel, pk);
+		Expr	   *expr = pathkey_expr(cxt->root, rel, pk);
 		bool		asc;
 
-		if (var == NULL)
+		if (expr == NULL)
 			elog(ERROR, "trino_fdw: pathkey unexpectedly not deparsable");
 		if (!first)
 			appendStringInfoString(buf, ", ");
 		first = false;
-		deparse_var(var, cxt);
+		deparse_expr((Node *) expr, cxt);
 #if PG_VERSION_NUM >= 180000
 		asc = (pk->pk_cmptype == COMPARE_LT);
 #else
@@ -1364,28 +1624,55 @@ deparse_pathkeys(StringInfo buf, PlannerInfo *root, RelOptInfo *baserel,
 }
 
 /*
- * Build the SELECT statement for a scan of foreignrel.
+ * GROUP BY: the grouping expressions, located in the grouped tlist via their
+ * sortgroupref.
+ */
+static void
+deparse_group_by(deparse_cxt *cxt, List *tlist)
+{
+	Query	   *query = cxt->root->parse;
+	ListCell   *lc;
+	bool		first = true;
+
+	if (query->groupClause == NIL)
+		return;
+	appendStringInfoString(cxt->buf, " GROUP BY ");
+	foreach(lc, query->groupClause)
+	{
+		SortGroupClause *grp = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupref_tle(grp->tleSortGroupRef, tlist);
+
+		if (!first)
+			appendStringInfoString(cxt->buf, ", ");
+		first = false;
+		deparse_expr((Node *) tle->expr, cxt);
+	}
+}
+
+/*
+ * Build the SELECT statement for a scan of rel, which may be a base
+ * relation, a pushed-down join, or a pushed-down aggregate over either.
  *
- * For a base relation, tlist is NIL and the columns in attrs_used (from the
- * rel's TrinoRelationInfo) are fetched.  For an upper relation (ORDER BY /
- * LIMIT pushdown) tlist lists the Vars to fetch, in order.
+ * For a base relation tlist is NIL and the columns in attrs_used are
+ * fetched; otherwise tlist lists the expressions to fetch, in order.
+ * remote_conds are the WHERE clauses (ignored for a grouped relation, whose
+ * WHERE clauses belong to its input and whose HAVING is in its fpinfo).
  */
 void
-trino_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
+trino_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
 					 List *tlist, List *remote_conds, List *pathkeys,
 					 bool has_limit, Node *limit_count, Node *limit_offset,
 					 List **retrieved_attrs, List **params_list,
 					 List **param_offsets)
 {
-	RelOptInfo *baserel = foreignrel;
-	TrinoRelationInfo *base_fpinfo = (TrinoRelationInfo *) baserel->fdw_private;
-	RangeTblEntry *rte = planner_rt_fetch(baserel->relid, root);
-	Relation	rel = table_open(rte->relid, NoLock);
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+	RelOptInfo *scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
+	TrinoRelationInfo *scan_fpinfo = (TrinoRelationInfo *) scanrel->fdw_private;
 	deparse_cxt cxt;
-	ListCell   *lc;
 
 	cxt.root = root;
-	cxt.foreignrel = baserel;
+	cxt.relids = scanrel->relids;
+	cxt.qualify = !IS_SIMPLE_REL(scanrel);
 	cxt.buf = buf;
 	cxt.params_list = params_list;
 	cxt.param_offsets = param_offsets;
@@ -1393,29 +1680,21 @@ trino_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 	*param_offsets = NIL;
 
 	appendStringInfoString(buf, "SELECT ");
-	deparse_target_list(buf, root, baserel, tlist, rel, base_fpinfo->attrs_used,
-						retrieved_attrs, &cxt);
+	deparse_target_list(&cxt, scanrel, tlist, retrieved_attrs);
 	appendStringInfoString(buf, " FROM ");
-	trino_deparse_relation(buf, rel, base_fpinfo->opts);
+	deparse_from(&cxt, scanrel);
 
-	if (remote_conds != NIL)
+	if (IS_UPPER_REL(rel))
 	{
-		bool		first = true;
-
-		appendStringInfoString(buf, " WHERE ");
-		foreach(lc, remote_conds)
-		{
-			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
-
-			if (!first)
-				appendStringInfoString(buf, " AND ");
-			first = false;
-			deparse_expr((Node *) ri->clause, &cxt);
-		}
+		deparse_conds(&cxt, scan_fpinfo->remote_conds, "WHERE");
+		deparse_group_by(&cxt, fpinfo->grouped_tlist);
+		deparse_conds(&cxt, fpinfo->having_remote, "HAVING");
 	}
+	else
+		deparse_conds(&cxt, remote_conds, "WHERE");
 
 	if (pathkeys != NIL)
-		deparse_pathkeys(buf, root, baserel, pathkeys, &cxt);
+		deparse_pathkeys(&cxt, rel, pathkeys);
 
 	if (has_limit)
 	{
@@ -1432,8 +1711,103 @@ trino_deparse_select(StringInfo buf, PlannerInfo *root, RelOptInfo *foreignrel,
 			deparse_expr(limit_count, &cxt);
 		}
 	}
+}
 
-	table_close(rel, NoLock);
+/*
+ * UPDATE rel SET "c" = expr, ... WHERE conds  /  DELETE FROM rel WHERE conds
+ */
+void
+trino_deparse_direct_modify(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+							CmdType operation, List *target_attrs,
+							List *target_exprs, List *remote_exprs,
+							List **params_list, List **param_offsets)
+{
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+	Relation	relation = table_open(rte->relid, NoLock);
+	deparse_cxt cxt;
+
+	cxt.root = root;
+	cxt.relids = rel->relids;
+	cxt.qualify = false;
+	cxt.buf = buf;
+	cxt.params_list = params_list;
+	cxt.param_offsets = param_offsets;
+	*params_list = NIL;
+	*param_offsets = NIL;
+
+	if (operation == CMD_UPDATE)
+	{
+		ListCell   *lc;
+		ListCell   *lc2;
+		bool		first = true;
+
+		appendStringInfoString(buf, "UPDATE ");
+		trino_deparse_relation(buf, relation, fpinfo->opts);
+		appendStringInfoString(buf, " SET ");
+		forboth(lc, target_attrs, lc2, target_exprs)
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+			trino_quote_identifier(buf, trino_get_column_name(rte->relid, lfirst_int(lc)));
+			appendStringInfoString(buf, " = ");
+			deparse_expr((Node *) lfirst(lc2), &cxt);
+		}
+	}
+	else
+	{
+		appendStringInfoString(buf, "DELETE FROM ");
+		trino_deparse_relation(buf, relation, fpinfo->opts);
+	}
+	deparse_conds(&cxt, remote_exprs, "WHERE");
+	table_close(relation, NoLock);
+}
+
+/*
+ * Human-readable description of a pushed-down join or aggregate for
+ * EXPLAIN, e.g. "Aggregate on ((public.t1 a) INNER JOIN (public.t2 b))".
+ */
+static void
+append_relation_name(StringInfo buf, PlannerInfo *root, RelOptInfo *rel)
+{
+	TrinoRelationInfo *fpinfo = (TrinoRelationInfo *) rel->fdw_private;
+
+	if (IS_SIMPLE_REL(rel))
+	{
+		RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+		char	   *namespace = get_namespace_name(get_rel_namespace(rte->relid));
+		char	   *relname = get_rel_name(rte->relid);
+		const char *refname = rte->eref->aliasname;
+
+		appendStringInfo(buf, "%s.%s", quote_identifier(namespace),
+						 quote_identifier(relname));
+		if (strcmp(refname, relname) != 0)
+			appendStringInfo(buf, " %s", quote_identifier(refname));
+		return;
+	}
+	if (IS_UPPER_REL(rel))
+	{
+		appendStringInfoString(buf, "Aggregate on (");
+		append_relation_name(buf, root, fpinfo->outerrel);
+		appendStringInfoChar(buf, ')');
+		return;
+	}
+	appendStringInfoChar(buf, '(');
+	append_relation_name(buf, root, fpinfo->outerrel);
+	appendStringInfo(buf, ") %s JOIN (", join_type_name(fpinfo->jointype));
+	append_relation_name(buf, root, fpinfo->innerrel);
+	appendStringInfoChar(buf, ')');
+}
+
+char *
+trino_relation_name(PlannerInfo *root, RelOptInfo *rel)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	append_relation_name(&buf, root, rel);
+	return buf.data;
 }
 
 /* INSERT INTO rel ("a", "b") VALUES  -- rows are appended by the caller */
