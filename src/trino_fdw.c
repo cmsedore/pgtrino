@@ -54,6 +54,8 @@
 
 PG_MODULE_MAGIC;
 
+void		_PG_init(void);
+
 PG_FUNCTION_INFO_V1(trino_fdw_handler);
 PG_FUNCTION_INFO_V1(trino_fdw_validator);
 PG_FUNCTION_INFO_V1(trino_fdw_version);
@@ -2286,7 +2288,11 @@ trino_acquire_sample_rows(Relation relation, int elevel, HeapTuple *rows,
 				rowstoskip = reservoir_get_next_S(&rstate, rstate_seen, targrows);
 			if (rowstoskip <= 0)
 			{
+#if PG_VERSION_NUM >= 150000
 				pos = (int) (targrows * sampler_random_fract(&rstate.randstate));
+#else
+				pos = (int) (targrows * sampler_random_fract(rstate.randstate));
+#endif
 				heap_freetuple(rows[pos]);
 			}
 			else

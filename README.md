@@ -352,6 +352,11 @@ The regression runner starts a second mock instance that answers with
 spooled-protocol segments, so that code path is covered without object
 storage.
 
+The expected output exists in three variants, picked automatically by
+pg_regress: the base file (PostgreSQL 16), `trino_fdw_1.out` (14 and 15:
+no pre-sorting for ordered-set aggregates, COPY not batched) and
+`trino_fdw_2.out` (17 and later: EXPLAIN format of InitPlans).
+
 `test/integration.sh` runs end-to-end checks against a real Trino with the
 `tpch` and `memory` catalogs (for example `docker run -p 8080:8080
 trinodb/trino`); when the server also has an `iceberg` catalog the
