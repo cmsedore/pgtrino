@@ -456,6 +456,17 @@ def plan_query(sql, want_spooling=False):
         pages.append(make_page(qid, 1, [("result", "boolean")], [[True]], False, update=(s.split()[0].upper(), None)))
         return qid, pages
 
+    if "information_schema.tables" in s:
+        m = re.search(r"table_schema = '([^']*)'", s)
+        schema = m.group(1) if m else ""
+        limit = re.search(r"table_name IN \((.*?)\)", s)
+        wanted = None
+        if limit:
+            wanted = [x.strip().strip("'") for x in limit.group(1).split(",")]
+        rows = [[t] for t in sorted(SCHEMA_TABLES) if schema == "s1" and (wanted is None or t in wanted)]
+        pages.append(make_page(qid, 1, [("table_name", "varchar")], rows, False))
+        return qid, pages
+
     if "information_schema.columns" in s:
         m = re.search(r"table_schema = '([^']*)'", s)
         schema = m.group(1) if m else ""

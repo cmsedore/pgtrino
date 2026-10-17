@@ -2357,6 +2357,60 @@ trinoAnalyzeForeignTable(Relation relation, AcquireSampleRowsFunc *func,
  * IMPORT FOREIGN SCHEMA
  * ---------------------------------------------------------------- */
 
+/* Column metadata for one batch of tables, appended to *columns */
+static void
+import_fetch_columns(TrinoOptions *opts, const char *catalog, const char *schema,
+					 List *tables, List **columns)
+{
+	StringInfoData sql;
+	ListCell   *lc;
+	bool		first = true;
+	MemoryContext mcxt;
+	TrinoQuery *q;
+	TjValue    *row;
+
+	initStringInfo(&sql);
+	appendStringInfoString(&sql,
+						   "SELECT table_name, column_name, data_type FROM ");
+	trino_quote_identifier(&sql, catalog);
+	appendStringInfoString(&sql, ".information_schema.columns WHERE table_schema = ");
+	trino_quote_literal(&sql, schema);
+	appendStringInfoString(&sql, " AND table_name IN (");
+	foreach(lc, tables)
+	{
+		if (!first)
+			appendStringInfoString(&sql, ", ");
+		first = false;
+		trino_quote_literal(&sql, (const char *) lfirst(lc));
+	}
+	appendStringInfoString(&sql, ") ORDER BY table_name, ordinal_position");
+
+	mcxt = AllocSetContextCreate(CurrentMemoryContext, "trino_fdw import columns",
+								 ALLOCSET_DEFAULT_SIZES);
+	q = trino_query_start(opts, sql.data, mcxt);
+	while ((row = trino_query_fetch_row(q)) != NULL)
+	{
+		if (tj_count(row) < 3 || tj_nth(row, 0)->type != TJ_STRING ||
+			tj_nth(row, 1)->type != TJ_STRING || tj_nth(row, 2)->type != TJ_STRING)
+			continue;
+		*columns = lappend(*columns, list_make3(pstrdup(tj_nth(row, 0)->str),
+												pstrdup(tj_nth(row, 1)->str),
+												pstrdup(tj_nth(row, 2)->str)));
+	}
+	trino_query_close(q);
+	MemoryContextDelete(mcxt);
+	pfree(sql.data);
+}
+
+/*
+ * IMPORT FOREIGN SCHEMA.
+ *
+ * Trino answers information_schema.columns for a whole schema by fetching
+ * metadata table by table from the connector, which can take an hour on a
+ * schema with thousands of tables.  With a short IN list of table names it
+ * only looks at those tables, so we list the names first (cheap) and then
+ * fetch columns in batches.
+ */
 static List *
 trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 {
@@ -2364,11 +2418,16 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 	TrinoOptions *opts = trino_get_server_options(serverOid, GetUserId());
 	char	   *catalog = opts->catalog;
 	bool		catalog_from_import = false;
+	int			batch_size = 50;
 	ListCell   *lc;
 	StringInfoData sql;
 	MemoryContext mcxt;
 	TrinoQuery *q;
 	TjValue    *row;
+	List	   *tables = NIL;
+	List	   *columns = NIL;
+	List	   *batch = NIL;
+	int			done = 0;
 	List	   *commands = NIL;
 	StringInfoData cmd;
 	char	   *cur_table = NULL;
@@ -2383,11 +2442,13 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 			catalog = defGetString(def);
 			catalog_from_import = true;
 		}
+		else if (strcmp(def->defname, "batch_size") == 0)
+			batch_size = option_int(def, 1, 100);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
 					 errmsg("invalid option \"%s\"", def->defname),
-					 errhint("Valid options in this context are: catalog")));
+					 errhint("Valid options in this context are: catalog, batch_size")));
 	}
 	if (catalog == NULL)
 		ereport(ERROR,
@@ -2396,11 +2457,11 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 				 errhint("Set the \"catalog\" option on the server, or pass "
 						 "OPTIONS (catalog 'name') to IMPORT FOREIGN SCHEMA.")));
 
+	/* 1. the table names */
 	initStringInfo(&sql);
-	appendStringInfoString(&sql,
-						   "SELECT table_name, column_name, data_type FROM ");
+	appendStringInfoString(&sql, "SELECT table_name FROM ");
 	trino_quote_identifier(&sql, catalog);
-	appendStringInfoString(&sql, ".information_schema.columns WHERE table_schema = ");
+	appendStringInfoString(&sql, ".information_schema.tables WHERE table_schema = ");
 	trino_quote_literal(&sql, stmt->remote_schema);
 	if (stmt->list_type == FDW_IMPORT_SCHEMA_LIMIT_TO)
 	{
@@ -2418,27 +2479,19 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		}
 		appendStringInfoChar(&sql, ')');
 	}
-	appendStringInfoString(&sql, " ORDER BY table_name, ordinal_position");
+	appendStringInfoString(&sql, " ORDER BY table_name");
 
 	mcxt = AllocSetContextCreate(CurrentMemoryContext, "trino_fdw import",
 								 ALLOCSET_DEFAULT_SIZES);
 	q = trino_query_start(opts, sql.data, mcxt);
-	initStringInfo(&cmd);
-
 	while ((row = trino_query_fetch_row(q)) != NULL)
 	{
 		const char *table;
-		const char *column;
-		const char *type;
 		bool		skip = false;
 
-		if (tj_count(row) < 3 || tj_nth(row, 0)->type != TJ_STRING ||
-			tj_nth(row, 1)->type != TJ_STRING || tj_nth(row, 2)->type != TJ_STRING)
+		if (tj_count(row) < 1 || tj_nth(row, 0)->type != TJ_STRING)
 			continue;
 		table = tj_nth(row, 0)->str;
-		column = tj_nth(row, 1)->str;
-		type = tj_nth(row, 2)->str;
-
 		if (stmt->list_type == FDW_IMPORT_SCHEMA_EXCEPT)
 		{
 			foreach(lc, stmt->table_list)
@@ -2449,12 +2502,40 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 					skip = true;
 			}
 		}
-		if (skip)
-			continue;
+		if (!skip)
+			tables = lappend(tables, pstrdup(table));
+	}
+	trino_query_close(q);
+	MemoryContextDelete(mcxt);
+
+	/* 2. their columns, a batch of tables at a time */
+	foreach(lc, tables)
+	{
+		batch = lappend(batch, lfirst(lc));
+		if (list_length(batch) == batch_size || lnext(tables, lc) == NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
+			import_fetch_columns(opts, catalog, stmt->remote_schema, batch, &columns);
+			done += list_length(batch);
+			if (list_length(tables) > batch_size)
+				ereport(NOTICE,
+						(errmsg("trino_fdw: fetched column metadata for %d of %d tables",
+								done, list_length(tables))));
+			batch = NIL;
+		}
+	}
+
+	/* 3. one CREATE FOREIGN TABLE per table */
+	initStringInfo(&cmd);
+	foreach(lc, columns)
+	{
+		List	   *col = (List *) lfirst(lc);
+		const char *table = (const char *) linitial(col);
+		const char *column = (const char *) lsecond(col);
+		const char *type = (const char *) lthird(col);
 
 		if (cur_table == NULL || strcmp(cur_table, table) != 0)
 		{
-			/* finish the previous table */
 			if (cur_table != NULL)
 			{
 				appendStringInfo(&cmd, "\n) SERVER %s OPTIONS (schema_name %s, table_name %s%s%s)",
@@ -2472,7 +2553,6 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 							 quote_identifier(stmt->local_schema),
 							 quote_identifier(table));
 		}
-
 		appendStringInfo(&cmd, "%s\n  %s %s", ncols > 0 ? "," : "",
 						 quote_identifier(column), trino_type_to_pg(type));
 		ncols++;
@@ -2488,8 +2568,6 @@ trinoImportForeignSchema(ImportForeignSchemaStmt *stmt, Oid serverOid)
 		commands = lappend(commands, pstrdup(cmd.data));
 	}
 
-	trino_query_close(q);
-	MemoryContextDelete(mcxt);
 	return commands;
 }
 

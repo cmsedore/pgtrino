@@ -97,10 +97,11 @@ Server: mock
 FDW options: (schema_name 's1', table_name 'weird name')
 
 SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
-                                                                       sql                                                                        
---------------------------------------------------------------------------------------------------------------------------------------------------
- SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' ORDER BY table_name, ordinal_position
-(1 row)
+                                                                                              sql                                                                                              
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ SELECT table_name FROM "mock".information_schema.tables WHERE table_schema = 's1' ORDER BY table_name
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t1', 't2', 'weird name') ORDER BY table_name, ordinal_position
+(2 rows)
 
 DROP SCHEMA imp CASCADE;
 CREATE SCHEMA imp;
@@ -124,7 +125,35 @@ IMPORT FOREIGN SCHEMA s1 EXCEPT (t2, "weird name") FROM SERVER mock INTO imp;
 
 IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (bogus 'x');
 ERROR:  invalid option "bogus"
-HINT:  Valid options in this context are: catalog
+HINT:  Valid options in this context are: catalog, batch_size
+-- large schemas are fetched a batch of tables at a time
+DROP SCHEMA imp CASCADE;
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (batch_size '2');
+\det imp.*
+    List of foreign tables
+ Schema |   Table    | Server 
+--------+------------+--------
+ imp    | t1         | mock
+ imp    | t2         | mock
+ imp    | weird name | mock
+(3 rows)
+
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+                                                                                        sql                                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ SELECT table_name FROM "mock".information_schema.tables WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name
+ SELECT table_name FROM "mock".information_schema.tables WHERE table_schema = 's1' ORDER BY table_name
+ SELECT table_name FROM "mock".information_schema.tables WHERE table_schema = 's1' ORDER BY table_name
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t1') ORDER BY table_name, ordinal_position
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t1', 't2') ORDER BY table_name, ordinal_position
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name, ordinal_position
+ SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('weird name') ORDER BY table_name, ordinal_position
+(7 rows)
+
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (batch_size '0');
+ERROR:  trino_fdw: invalid value for option "batch_size": "0"
+DETAIL:  Expected an integer between 1 and 100.
 DROP SCHEMA imp CASCADE;
 -- a server without a catalog needs one at import time
 CREATE SERVER nocat FOREIGN DATA WRAPPER trino_fdw OPTIONS (host '127.0.0.1', port '18080');
@@ -188,10 +217,9 @@ SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORD
  SELECT "id", "name", "val", "created", "flag", "tags", "attrs", "big", "bin", "dec", "d", "u", "ts_tz", "dur" FROM "mock"."s1"."t1" ORDER BY "id" ASC NULLS LAST
  SELECT "id", "tags", "attrs", "big", "dur" FROM "mock"."s1"."t1" ORDER BY "id" ASC NULLS LAST
  SELECT count(*) FROM "mock"."s1"."t1"
+ SELECT table_name FROM "mock".information_schema.tables WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name
  SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name, ordinal_position
- SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' AND table_name IN ('t2') ORDER BY table_name, ordinal_position
- SELECT table_name, column_name, data_type FROM "mock".information_schema.columns WHERE table_schema = 's1' ORDER BY table_name, ordinal_position
-(6 rows)
+(5 rows)
 
 -- stopping early cancels the remote query (the mock logs the DELETE)
 SELECT id FROM t1 WHERE name ~ 'a' LIMIT 1;

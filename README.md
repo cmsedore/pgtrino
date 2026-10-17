@@ -174,6 +174,13 @@ IMPORT FOREIGN SCHEMA tiny EXCEPT (lineitem) FROM SERVER trino INTO tpch_tiny;
 IMPORT FOREIGN SCHEMA tiny FROM SERVER trino INTO tpch_tiny OPTIONS (catalog 'tpch');
 ```
 
+Trino fetches column metadata from the connector table by table, which on
+a schema with thousands of tables (a JDBC-connected SQL Server, say) can take
+very long for a single `information_schema.columns` query. The import
+therefore lists the table names first and then fetches columns in batches of
+`batch_size` tables (default 50, maximum 100: Trino only narrows the lookup
+to the named tables below that), printing a NOTICE per batch.
+
 ## Type mapping
 
 Values arrive as JSON and are converted through the PostgreSQL input function

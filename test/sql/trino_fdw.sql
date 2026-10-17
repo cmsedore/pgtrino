@@ -53,6 +53,13 @@ CREATE SCHEMA imp;
 IMPORT FOREIGN SCHEMA s1 EXCEPT (t2, "weird name") FROM SERVER mock INTO imp;
 \det imp.*
 IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (bogus 'x');
+-- large schemas are fetched a batch of tables at a time
+DROP SCHEMA imp CASCADE;
+CREATE SCHEMA imp;
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (batch_size '2');
+\det imp.*
+SELECT sql FROM trino_query('mock', 'SELECT sql FROM sqllog') AS t(sql text) ORDER BY 1;
+IMPORT FOREIGN SCHEMA s1 FROM SERVER mock INTO imp OPTIONS (batch_size '0');
 DROP SCHEMA imp CASCADE;
 
 -- a server without a catalog needs one at import time
