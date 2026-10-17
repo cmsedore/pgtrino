@@ -28,8 +28,11 @@ jobs:
           sudo make PG_CONFIG=$PG_CONFIG install
       - name: Start PostgreSQL
         run: |
+          # the PGDG packages on GitHub runners do not create a cluster
+          sudo pg_lsclusters | grep -q "^${{ matrix.pg }} *main" || sudo pg_createcluster ${{ matrix.pg }} main
           sudo pg_ctlcluster ${{ matrix.pg }} main start
-          sudo -u postgres psql -c "CREATE ROLE runner SUPERUSER LOGIN"
+          sudo -u postgres psql -p "$(sudo pg_lsclusters -h | awk '$1 == "${{ matrix.pg }}" {print $3}')" -c "CREATE ROLE runner SUPERUSER LOGIN"
+          echo "PGPORT=$(sudo pg_lsclusters -h | awk '$1 == "${{ matrix.pg }}" {print $3}')" >> "$GITHUB_ENV"
       - name: Regression tests against the mock Trino server
         run: test/run_tests.sh PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
       - name: Show diffs on failure
@@ -52,8 +55,9 @@ jobs:
           sudo apt-get install -y postgresql-16 postgresql-server-dev-16 libcurl4-openssl-dev
       - name: Build and install
         run: |
-          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config
-          sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config install
+          # the distribution's pg_config asks for a clang that is not installed
+          make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config with_llvm=no
+          sudo make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config with_llvm=no install
       - name: Add a memory catalog to Trino
         run: |
           CID=$(docker ps -q --filter ancestor=trinodb/trino:476)
@@ -62,6 +66,7 @@ jobs:
           docker restart "$CID"
       - name: Start PostgreSQL
         run: |
+          sudo pg_lsclusters | grep -q "^16 *main" || sudo pg_createcluster 16 main
           sudo pg_ctlcluster 16 main start
           sudo -u postgres psql -c "CREATE ROLE runner SUPERUSER LOGIN"
       - name: Wait for Trino

@@ -82,6 +82,11 @@ sudo make install
 make PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config && sudo make install PG_CONFIG=...
 ```
 
+If `make` fails with `clang-NN: No such file or directory`, your PostgreSQL
+packages were built with LLVM JIT support and expect clang for the optional
+bitcode files. Either install the matching `clang` package or build without
+it: `make with_llvm=no && sudo make with_llvm=no install`.
+
 Then, in each database: `CREATE EXTENSION trino_fdw;`
 
 ## Setting up
